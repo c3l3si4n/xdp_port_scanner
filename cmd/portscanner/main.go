@@ -13,6 +13,7 @@ import (
     "strings"
     "time"
     "runtime"
+    "bytes"
 
     "github.com/google/gopacket"
     "github.com/google/gopacket/layers"
@@ -94,14 +95,28 @@ func main() {
         log.Fatalf("no IPv4 address found on %s", ifaceName)
     }
 
-    // Resolve destination MACs using ARP via pcap (best effort); fallback broadcast
-    destMAC := make(map[string]net.HardwareAddr)
-    handle, err := pcap.OpenLive(ifaceName, 65535, false, pcap.BlockForever)
+    // Find default gateway to resolve its MAC address
+    routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
     if err != nil {
-        log.Printf("pcap open failed, will use broadcast MAC: %v", err)
-    } else {
-        _ = handle.Close() // not actually using yet, placeholder for potential ARP resolution logic
+        log.Fatalf("could not list routes: %v", err)
     }
+    var gatewayIP net.IP
+    for _, r := range routes {
+        if r.Dst == nil {
+            gatewayIP = r.Gw
+            break
+        }
+    }
+    if gatewayIP == nil {
+        log.Fatalf("could not determine default gateway on %s", ifaceName)
+    }
+    log.Printf("Found default gateway: %s", gatewayIP)
+
+    gatewayMAC, err := getGatewayMAC(ifaceName, srcIP, gatewayIP, verbose)
+    if err != nil {
+        log.Fatalf("Could not resolve gateway MAC: %v. Please ensure you are running with sufficient privileges and you can ping the gateway.", err)
+    }
+    log.Printf("Resolved gateway MAC: %s", gatewayMAC)
 
     // Set SKB mode
     xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
@@ -169,7 +184,7 @@ func main() {
                 d := &descs[i]
                 target := dests[idx]
                 idx = (idx + 1) % len(dests)
-                pkt := buildSYN(srcMAC, srcIP, srcPort, target, destMAC)
+                pkt := buildSYN(srcMAC, gatewayMAC, srcIP, srcPort, target)
                 frame := xsk.GetFrame(*d)
                 copy(frame, pkt)
                 d.Len = uint32(len(pkt))
@@ -268,13 +283,7 @@ func parsePorts(s string) ([]uint16, error) {
     return res, nil
 }
 
-func buildSYN(srcMAC net.HardwareAddr, srcIP net.IP, srcPort int, dst dest, macMap map[string]net.HardwareAddr) []byte {
-    dstMAC := macMap[dst.ip.String()]
-    if dstMAC == nil {
-        // fallback broadcast
-        dstMAC = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-    }
-
+func buildSYN(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int, dst dest) []byte {
     eth := &layers.Ethernet{
         SrcMAC:       srcMAC,
         DstMAC:       dstMAC,
@@ -341,4 +350,58 @@ func processPacket(pkt []byte, srcPort int, verbose bool) string {
         }
     }
     return ""
+}
+
+func getGatewayMAC(ifaceName string, srcIP, gatewayIP net.IP, verbose bool) (net.HardwareAddr, error) {
+    iface, err := net.InterfaceByName(ifaceName)
+    if err != nil {
+        return nil, err
+    }
+
+    handle, err := pcap.OpenLive(ifaceName, 1024, true, 3*time.Second)
+    if err != nil {
+        return nil, fmt.Errorf("pcap open live failed: %w", err)
+    }
+    defer handle.Close()
+
+    // Create ARP request
+    eth := layers.Ethernet{
+        SrcMAC:       iface.HardwareAddr,
+        DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // Broadcast
+        EthernetType: layers.EthernetTypeARP,
+    }
+    arp := layers.ARP{
+        AddrType:          layers.LinkTypeEthernet,
+        Protocol:          layers.EthernetTypeIPv4,
+        HwAddressSize:     6,
+        ProtAddressSize:   4,
+        Operation:         layers.ARPRequest,
+        SourceHwAddress:   []byte(iface.HardwareAddr),
+        SourceProtAddress: []byte(srcIP.To4()),
+        DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+        DstProtAddress:    []byte(gatewayIP.To4()),
+    }
+
+    buf := gopacket.NewSerializeBuffer()
+    opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+    gopacket.SerializeLayers(buf, opts, &eth, &arp)
+
+    if verbose {
+        log.Println("Sending ARP request for gateway")
+    }
+    if err := handle.WritePacketData(buf.Bytes()); err != nil {
+        return nil, err
+    }
+
+    // Listen for ARP reply
+    packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+    for packet := range packetSource.Packets() {
+        if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
+            arp, _ := arpLayer.(*layers.ARP)
+            if arp.Operation == layers.ARPReply && bytes.Equal(arp.SourceProtAddress, []byte(gatewayIP.To4())) {
+                return net.HardwareAddr(arp.SourceHwAddress), nil
+            }
+        }
+    }
+    return nil, fmt.Errorf("ARP reply not received from gateway")
 } 
