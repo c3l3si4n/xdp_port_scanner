@@ -14,6 +14,8 @@ import (
     "time"
     "runtime"
     "bytes"
+    "bufio"
+    "encoding/binary"
 
     "github.com/google/gopacket"
     "github.com/google/gopacket/layers"
@@ -95,21 +97,28 @@ func main() {
         log.Fatalf("no IPv4 address found on %s", ifaceName)
     }
 
-    // Find default gateway to resolve its MAC address
-    routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
+    // Find default gateway by parsing /proc/net/route, as it's more robust.
+    defaultRoutes, err := getDefaultRoutes(verbose)
     if err != nil {
-        log.Fatalf("could not list routes: %v", err)
+        log.Fatalf("could not determine default gateway: %v", err)
     }
+
     var gatewayIP net.IP
-    for _, r := range routes {
-        if r.Dst == nil {
-            gatewayIP = r.Gw
+    for _, r := range defaultRoutes {
+        if r.ifaceName == ifaceName {
+            gatewayIP = r.gatewayIP
             break
         }
     }
+
     if gatewayIP == nil {
-        log.Fatalf("could not determine default gateway on %s", ifaceName)
+        var suggestions []string
+        for _, r := range defaultRoutes {
+            suggestions = append(suggestions, fmt.Sprintf("iface %s (gateway %s)", r.ifaceName, r.gatewayIP))
+        }
+        log.Fatalf("could not determine default gateway on %s. Found default route(s) on other interfaces: [%s]. Please specify the correct interface with -iface.", ifaceName, strings.Join(suggestions, ", "))
     }
+
     log.Printf("Found default gateway: %s", gatewayIP)
 
     gatewayMAC, err := getGatewayMAC(ifaceName, srcIP, gatewayIP, verbose)
@@ -404,4 +413,68 @@ func getGatewayMAC(ifaceName string, srcIP, gatewayIP net.IP, verbose bool) (net
         }
     }
     return nil, fmt.Errorf("ARP reply not received from gateway")
+}
+
+type defaultRouteInfo struct {
+    ifaceName string
+    gatewayIP net.IP
+}
+
+// getDefaultRoutes reads /proc/net/route to find the default gateway(s).
+func getDefaultRoutes(verbose bool) ([]defaultRouteInfo, error) {
+    f, err := os.Open("/proc/net/route")
+    if err != nil {
+        return nil, err
+    }
+    defer f.Close()
+
+    var routes []defaultRouteInfo
+
+    scanner := bufio.NewScanner(f)
+    // Skip header
+    if scanner.Scan() {
+        // Do nothing with the header line
+    }
+
+    for scanner.Scan() {
+        line := scanner.Text()
+        fields := strings.Fields(line)
+        if len(fields) < 8 {
+            continue
+        }
+        if verbose {
+            log.Printf("Parsing route: %s", line)
+        }
+        // Default route is where destination and mask are both 0.
+        if fields[1] == "00000000" && fields[7] == "00000000" {
+            gatewayHex := fields[2]
+            var gw uint32
+            _, err := fmt.Sscanf(gatewayHex, "%x", &gw)
+            if err != nil {
+                if verbose {
+                    log.Printf("Could not parse gateway hex '%s': %v", gatewayHex, err)
+                }
+                continue // Couldn't parse gateway address
+            }
+
+            // The gateway address in /proc/net/route is in little-endian format.
+            gatewayIP := make(net.IP, 4)
+            binary.LittleEndian.PutUint32(gatewayIP, gw)
+
+            routes = append(routes, defaultRouteInfo{
+                ifaceName: fields[0],
+                gatewayIP: gatewayIP,
+            })
+        }
+    }
+
+    if err := scanner.Err(); err != nil {
+        return nil, fmt.Errorf("error scanning /proc/net/route: %w", err)
+    }
+
+    if len(routes) == 0 {
+        return nil, fmt.Errorf("no default route found in /proc/net/route")
+    }
+
+    return routes, nil
 } 
