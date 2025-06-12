@@ -203,6 +203,41 @@ func main() {
 
     log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
 
+    // Stats tracking
+    var totalTx, totalRx, completedCount, openCount, closedCount uint64
+    go func() {
+        var lastTx, lastRx, lastCompleted uint64
+        lastTime := time.Now()
+        ticker := time.NewTicker(2 * time.Second) // Report every 2s for less noise
+        defer ticker.Stop()
+
+        for range ticker.C {
+            now := time.Now()
+            elapsed := now.Sub(lastTime)
+            if elapsed == 0 {
+                continue
+            }
+
+            currentTx := atomic.LoadUint64(&totalTx)
+            currentRx := atomic.LoadUint64(&totalRx)
+            currentCompleted := atomic.LoadUint64(&completedCount)
+            currentOpen := atomic.LoadUint64(&openCount)
+            currentClosed := atomic.LoadUint64(&closedCount)
+
+            txPps := float64(currentTx-lastTx) / elapsed.Seconds()
+            rxPps := float64(currentRx-lastRx) / elapsed.Seconds()
+            scansPerSec := float64(currentCompleted-lastCompleted) / elapsed.Seconds()
+
+            log.Printf("Stats: TX %.0f pps, RX %.0f pps, Scans %.0f/s | Outstanding: %d | Open: %d, Closed: %d",
+                txPps, rxPps, scansPerSec, len(outstanding), currentOpen, currentClosed)
+
+            lastTx = currentTx
+            lastRx = currentRx
+            lastCompleted = currentCompleted
+            lastTime = now
+        }
+    }()
+
     // Pre-fill RX descriptors
     fillDescs := xsk.GetDescs(cap(xsk.GetDescs(0, true)), true)
     if len(fillDescs) > 0 {
@@ -217,24 +252,11 @@ func main() {
         d.isQueued = true // It is now in the pending queue
     }
 
-    // Stats tracking
-    var txPps, rxPps uint64
-    go func() {
-        ticker := time.NewTicker(1 * time.Second)
-        defer ticker.Stop()
-        for range ticker.C {
-            log.Printf("Stats: TX %d pps, RX %d pps, Outstanding: %d", txPps, rxPps, len(outstanding))
-            atomic.StoreUint64(&txPps, 0)
-            atomic.StoreUint64(&rxPps, 0)
-        }
-    }()
-
     runtime.LockOSThread() // dedicate scanning loop to this core
 
     nextDestIndex := 0
     var retryDests []*dest
     var retryNextIndex int
-    completedCount := 0
 
     for len(outstanding) > 0 {
         // 1. Send packets
@@ -275,7 +297,7 @@ func main() {
 
             if packetsToSend > 0 {
                 xsk.Transmit(descs[:packetsToSend])
-                atomic.AddUint64(&txPps, uint64(packetsToSend))
+                atomic.AddUint64(&totalTx, uint64(packetsToSend))
             }
         }
 
@@ -290,7 +312,7 @@ func main() {
 
         if numRx > 0 {
             rxDescs := xsk.Receive(numRx)
-            atomic.AddUint64(&rxPps, uint64(len(rxDescs)))
+            atomic.AddUint64(&totalRx, uint64(len(rxDescs)))
             for _, d := range rxDescs {
                 frame := xsk.GetFrame(d)
                 if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
@@ -298,11 +320,15 @@ func main() {
                     if target, ok := outstanding[key]; ok {
                         target.status = status
                         delete(outstanding, key)
-                        completedCount++
+                        atomic.AddUint64(&completedCount, 1)
                         if status == "open" {
+                            atomic.AddUint64(&openCount, 1)
                             fmt.Printf("OPEN: %s\n", key)
-                        } else if showClosed && status == "closed" {
-                            fmt.Printf("CLOSED: %s\n", key)
+                        } else if status == "closed" {
+                            atomic.AddUint64(&closedCount, 1)
+                            if showClosed {
+                                fmt.Printf("CLOSED: %s\n", key)
+                            }
                         }
                     }
                 }
@@ -328,7 +354,7 @@ func main() {
                     }
                     target.status = "filtered"
                     delete(outstanding, key)
-                    completedCount++
+                    atomic.AddUint64(&completedCount, 1)
                 } else {
                     if !target.isQueued {
                         // Add to the queue for re-transmission
@@ -340,7 +366,7 @@ func main() {
         }
     }
 
-    log.Printf("Scan complete. %d ports processed.", completedCount)
+    log.Printf("Scan complete. %d ports processed.", atomic.LoadUint64(&completedCount))
 }
 
 type dest struct {
