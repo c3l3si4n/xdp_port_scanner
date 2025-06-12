@@ -12,6 +12,7 @@ import (
     "os"
     "strings"
     "time"
+    "runtime"
 
     "github.com/google/gopacket"
     "github.com/google/gopacket/layers"
@@ -27,12 +28,16 @@ func main() {
         ipsArg    string
         portsArg  string
         srcPort   int
+        verbose   bool
+        timeout   int
     )
 
     flag.StringVar(&ifaceName, "iface", "", "Network interface to use (mandatory)")
     flag.StringVar(&ipsArg, "ips", "", "Comma separated list of target IPv4 addresses")
     flag.StringVar(&portsArg, "ports", "1-1024", "Ports to scan, e.g. 80,443,1000-2000")
     flag.IntVar(&srcPort, "srcport", 54321, "Source TCP port to use for SYN packets")
+    flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
+    flag.IntVar(&timeout, "timeout", 5, "Seconds to wait after last packet sent before exiting")
     flag.Parse()
 
     if ifaceName == "" || ipsArg == "" || portsArg == "" {
@@ -123,6 +128,15 @@ func main() {
         log.Fatalf("Register socket in program: %v", err)
     }
 
+    // Enable kernel busy polling on this socket (microseconds) and prefer busy poll
+    const busyPollTime = 50_000 // 50 usec; tune as needed
+    if err := unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollTime); err != nil {
+        log.Printf("SO_BUSY_POLL set failed (kernel <3.11 or unsupported): %v", err)
+    }
+    if err := unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_PREFER_BUSY_POLL, 1); err != nil {
+        log.Printf("SO_PREFER_BUSY_POLL set failed: %v", err)
+    }
+
     rand.Seed(time.Now().UnixNano())
 
     log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
@@ -131,9 +145,12 @@ func main() {
     fillDescs := xsk.GetDescs(cap(xsk.GetDescs(0, true)), true)
     xsk.Fill(fillDescs)
 
+    doneTx := make(chan struct{})
     go func() {
+        runtime.LockOSThread() // keep TX loop on dedicated CPU core
         // transmitter goroutine
         idx := 0
+        sent := 0
         for {
             // maintain TX completion
             if c := xsk.NumCompleted(); c > 0 {
@@ -156,28 +173,64 @@ func main() {
                 frame := xsk.GetFrame(*d)
                 copy(frame, pkt)
                 d.Len = uint32(len(pkt))
+                sent++
             }
             xsk.Transmit(descs)
+
+            if sent >= len(dests) {
+                if verbose {
+                    log.Printf("Transmitted all %d SYNs", sent)
+                }
+                break
+            }
         }
+        doneTx <- struct{}{}
     }()
 
-    // receiver loop
+    runtime.LockOSThread() // dedicate RX busy loop to this core
+
+    // Track outstanding
+    outstanding := make(map[string]struct{}, len(dests))
+    for _, d := range dests {
+        key := fmt.Sprintf("%s:%d", d.ip.String(), d.port)
+        outstanding[key] = struct{}{}
+    }
+
+    lastActivity := time.Now()
+
     for {
-        // poll with short timeout
-        numRx, _, err := xsk.Poll(100)
-        if err != nil {
-            log.Fatalf("poll: %v", err)
-        }
+        numRx := xsk.NumReceived()
         if numRx == 0 {
+            // Hint CPU to reduce power while spinning
+            runtime.Gosched()
+
+            select {
+            case <-doneTx:
+                // wait for timeout after last packet sent
+                if time.Since(lastActivity) > time.Duration(timeout)*time.Second {
+                    if verbose {
+                        log.Printf("Timeout reached, exiting")
+                    }
+                    return
+                }
+            default:
+            }
             continue
         }
         rxDescs := xsk.Receive(numRx)
         for _, d := range rxDescs {
             frame := xsk.GetFrame(d)
-            processPacket(frame, srcPort)
+            if key := processPacket(frame, srcPort, verbose); key != "" {
+                delete(outstanding, key)
+                if len(outstanding) == 0 {
+                    fmt.Println("Scan complete")
+                    return
+                }
+            }
         }
         // Recycle RX descs
         xsk.Fill(rxDescs)
+        lastActivity = time.Now()
     }
 }
 
@@ -250,30 +303,42 @@ func buildSYN(srcMAC net.HardwareAddr, srcIP net.IP, srcPort int, dst dest, macM
     return buf.Bytes()
 }
 
-func processPacket(pkt []byte, srcPort int) {
+// processPacket inspects packet, returns target key if SYN-ACK observed
+func processPacket(pkt []byte, srcPort int, verbose bool) string {
     if len(pkt) < 34 { // Ethernet + IPv4 min
-        return
+        return ""
     }
     if pkt[12] != 0x08 || pkt[13] != 0x00 { // not IPv4
-        return
+        return ""
     }
     ipHeaderLen := (pkt[14] & 0x0F) * 4
     if len(pkt) < int(14+ipHeaderLen+20) {
-        return
+        return ""
     }
     proto := pkt[23]
     if proto != 6 { // TCP
-        return
+        return ""
     }
     tcpStart := 14 + ipHeaderLen
     srcPortPkt := int(pkt[tcpStart])<<8 | int(pkt[tcpStart+1])
     dstPortPkt := int(pkt[tcpStart+2])<<8 | int(pkt[tcpStart+3])
     if dstPortPkt != srcPort { // only care replies to our src port
-        return
+        return ""
     }
     flags := pkt[tcpStart+13]
     if flags&0x12 == 0x12 { // SYN+ACK
         srcIP := net.IPv4(pkt[26], pkt[27], pkt[28], pkt[29])
-        fmt.Printf("OPEN %s:%d\n", srcIP.String(), srcPortPkt)
+        result := fmt.Sprintf("%s:%d", srcIP.String(), srcPortPkt)
+        fmt.Printf("OPEN %s\n", result)
+        return result
     }
+    if verbose {
+        // log non-SYN ACK responses for debugging
+        srcIP := net.IPv4(pkt[26], pkt[27], pkt[28], pkt[29])
+        if proto == 6 {
+            srcPortPkt := int(pkt[14+ipHeaderLen])<<8 | int(pkt[14+ipHeaderLen+1])
+            fmt.Printf("DEBUG reply flags %02x from %s:%d\n", pkt[14+ipHeaderLen+13], srcIP.String(), srcPortPkt)
+        }
+    }
+    return ""
 } 
