@@ -366,7 +366,7 @@ func main() {
         }
     }
 
-    log.Printf("Scan complete. %d ports processed.", atomic.LoadUint64(&completedCount))
+    log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.", atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
 }
 
 type dest struct {
