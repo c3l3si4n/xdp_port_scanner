@@ -37,6 +37,7 @@ func main() {
         verbose      bool
         retryTimeout time.Duration
         maxRetries   int
+        showClosed   bool
     )
 
     flag.StringVar(&ifaceName, "iface", "", "Network interface to use (mandatory)")
@@ -46,6 +47,7 @@ func main() {
     flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
     flag.DurationVar(&retryTimeout, "retry-timeout", 1*time.Second, "Time to wait for a response before retrying a port")
     flag.IntVar(&maxRetries, "retries", 3, "Number of retries for each port before marking as filtered")
+    flag.BoolVar(&showClosed, "show-closed", false, "Show closed ports in output")
     flag.Parse()
 
     if ifaceName == "" || ipsArg == "" || portsArg == "" {
@@ -194,6 +196,11 @@ func main() {
 
     rand.Seed(time.Now().UnixNano())
 
+    // Randomize scan order to be less predictable and nicer to networks
+    rand.Shuffle(len(dests), func(i, j int) {
+        dests[i], dests[j] = dests[j], dests[i]
+    })
+
     log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
 
     // Pre-fill RX descriptors
@@ -224,7 +231,9 @@ func main() {
 
     runtime.LockOSThread() // dedicate scanning loop to this core
 
-    pendingDests := dests
+    nextDestIndex := 0
+    var retryDests []*dest
+    var retryNextIndex int
     completedCount := 0
 
     for len(outstanding) > 0 {
@@ -233,23 +242,37 @@ func main() {
         descs := xsk.GetDescs(xsk.NumFreeTxSlots(), false)
         if len(descs) > 0 {
             packetsToSend := 0
-            for i, d := range descs {
-                if len(pendingDests) == 0 {
+            for i := range descs {
+                var target *dest
+                // Prioritize retries
+                if retryNextIndex < len(retryDests) {
+                    target = retryDests[retryNextIndex]
+                    retryNextIndex++
+                } else if nextDestIndex < len(dests) {
+                    target = dests[nextDestIndex]
+                    nextDestIndex++
+                } else {
+                    // No more packets to send for now
+                    if retryNextIndex > 0 && retryNextIndex == len(retryDests) {
+                        // We have processed all retries in the current batch, clear the slice for the next one
+                        retryDests = retryDests[:0]
+                        retryNextIndex = 0
+                    }
                     break
                 }
-                target := pendingDests[0]
-                pendingDests = pendingDests[1:]
+
                 target.isQueued = false
 
                 pkt := buildSYN(srcMAC, gatewayMAC, srcIP, srcPort, *target)
                 frame := xsk.GetFrame(descs[i])
                 copy(frame, pkt)
                 descs[i].Len = uint32(len(pkt))
-                
+
                 target.lastSent = now
                 target.retries++
                 packetsToSend++
             }
+
             if packetsToSend > 0 {
                 xsk.Transmit(descs[:packetsToSend])
                 atomic.AddUint64(&txPps, uint64(packetsToSend))
@@ -276,7 +299,11 @@ func main() {
                         target.status = status
                         delete(outstanding, key)
                         completedCount++
-                        fmt.Printf("OPEN %s\n", key)
+                        if status == "open" {
+                            fmt.Printf("OPEN: %s\n", key)
+                        } else if showClosed && status == "closed" {
+                            fmt.Printf("CLOSED: %s\n", key)
+                        }
                     }
                 }
             }
@@ -304,8 +331,8 @@ func main() {
                     completedCount++
                 } else {
                     if !target.isQueued {
-                        // Add to the front of the queue for re-transmission
-                        pendingDests = append([]*dest{target}, pendingDests...)
+                        // Add to the queue for re-transmission
+                        retryDests = append(retryDests, target)
                         target.isQueued = true
                     }
                 }
