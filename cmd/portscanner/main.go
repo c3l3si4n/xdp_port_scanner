@@ -207,6 +207,7 @@ func main() {
     for _, d := range dests {
         key := fmt.Sprintf("%s:%d", d.ip.String(), d.port)
         outstanding[key] = d
+        d.isQueued = true // It is now in the pending queue
     }
 
     // Stats tracking
@@ -238,6 +239,7 @@ func main() {
                 }
                 target := pendingDests[0]
                 pendingDests = pendingDests[1:]
+                target.isQueued = false
 
                 pkt := buildSYN(srcMAC, gatewayMAC, srcIP, srcPort, *target)
                 frame := xsk.GetFrame(descs[i])
@@ -287,6 +289,11 @@ func main() {
             if target.status != "unknown" {
                 continue // Already handled
             }
+            // Don't check timeout for something that was never sent
+            if target.lastSent.IsZero() {
+                continue
+            }
+
             if now.Sub(target.lastSent) > retryTimeout {
                 if target.retries >= maxRetries {
                     if verbose {
@@ -296,8 +303,11 @@ func main() {
                     delete(outstanding, key)
                     completedCount++
                 } else {
-                    // Add to the front of the queue for re-transmission
-                    pendingDests = append([]*dest{target}, pendingDests...)
+                    if !target.isQueued {
+                        // Add to the front of the queue for re-transmission
+                        pendingDests = append([]*dest{target}, pendingDests...)
+                        target.isQueued = true
+                    }
                 }
             }
         }
@@ -312,6 +322,7 @@ type dest struct {
     status   string // unknown, open, closed, filtered
     retries  int
     lastSent time.Time
+    isQueued bool
 }
 
 func parsePorts(s string) ([]uint16, error) {
