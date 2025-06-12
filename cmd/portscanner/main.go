@@ -203,6 +203,14 @@ func main() {
 
     log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
 
+    // Map to quickly find dest by ip:port string
+    outstanding := make(map[string]*dest, len(dests))
+    for _, d := range dests {
+        key := fmt.Sprintf("%s:%d", d.ip.String(), d.port)
+        outstanding[key] = d
+        d.isQueued = true // It is now in the pending queue
+    }
+
     // Stats tracking
     var totalTx, totalRx, completedCount, openCount, closedCount uint64
     go func() {
@@ -242,14 +250,6 @@ func main() {
     fillDescs := xsk.GetDescs(cap(xsk.GetDescs(0, true)), true)
     if len(fillDescs) > 0 {
         xsk.Fill(fillDescs)
-    }
-
-    // Map to quickly find dest by ip:port string
-    outstanding := make(map[string]*dest, len(dests))
-    for _, d := range dests {
-        key := fmt.Sprintf("%s:%d", d.ip.String(), d.port)
-        outstanding[key] = d
-        d.isQueued = true // It is now in the pending queue
     }
 
     runtime.LockOSThread() // dedicate scanning loop to this core
