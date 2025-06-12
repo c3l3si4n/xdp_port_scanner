@@ -162,7 +162,18 @@ func main() {
     }()
     defer cleanup()
 
-    xsk, err := xdp.NewSocket(link.Attrs().Index, 0, nil)
+    // With large numbers of ports, we need larger rings. Note that this
+    // may require raising the locked memory limit on your system (ulimit -l).
+    socketOptions := xdp.SocketOptions{
+        NumFrames:              8192,
+        FrameSize:              4096,
+        FillRingNumDescs:       4096,
+        CompletionRingNumDescs: 4096,
+        RxRingNumDescs:         4096,
+        TxRingNumDescs:         4096,
+    }
+
+    xsk, err := xdp.NewSocket(link.Attrs().Index, 0, &socketOptions)
     if err != nil {
         log.Fatalf("NewSocket: %v", err)
     }
@@ -173,7 +184,7 @@ func main() {
     }
 
     // Enable kernel busy polling on this socket (microseconds) and prefer busy poll
-    const busyPollTime = 50_000 // 50 usec; tune as needed
+    const busyPollTime = 50 // 50 usec; tune as needed
     if err := unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollTime); err != nil {
         log.Printf("SO_BUSY_POLL set failed (kernel <3.11 or unsupported): %v", err)
     }
@@ -244,7 +255,7 @@ func main() {
         }
 
         // 2. Receive packets
-        numRx, completed, err := xsk.Poll(100) // 100ms poll timeout
+        numRx, completed, err := xsk.Poll(1) // 1ms poll timeout
         if err != nil && err != unix.EAGAIN {
             log.Printf("Poll error: %v", err)
         }
