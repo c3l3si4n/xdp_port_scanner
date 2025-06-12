@@ -18,6 +18,7 @@ import (
     "bytes"
     "bufio"
     "encoding/binary"
+    "sync/atomic"
 
     "github.com/google/gopacket"
     "github.com/google/gopacket/layers"
@@ -197,6 +198,18 @@ func main() {
         outstanding[key] = d
     }
 
+    // Stats tracking
+    var txPps, rxPps uint64
+    go func() {
+        ticker := time.NewTicker(1 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            log.Printf("Stats: TX %d pps, RX %d pps, Outstanding: %d", txPps, rxPps, len(outstanding))
+            atomic.StoreUint64(&txPps, 0)
+            atomic.StoreUint64(&rxPps, 0)
+        }
+    }()
+
     runtime.LockOSThread() // dedicate scanning loop to this core
 
     pendingDests := dests
@@ -226,6 +239,7 @@ func main() {
             }
             if packetsToSend > 0 {
                 xsk.Transmit(descs[:packetsToSend])
+                atomic.AddUint64(&txPps, uint64(packetsToSend))
             }
         }
 
@@ -240,6 +254,7 @@ func main() {
 
         if numRx > 0 {
             rxDescs := xsk.Receive(numRx)
+            atomic.AddUint64(&rxPps, uint64(len(rxDescs)))
             for _, d := range rxDescs {
                 frame := xsk.GetFrame(d)
                 if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
