@@ -10,7 +10,9 @@ import (
     "math/rand"
     "net"
     "os"
+    "os/signal"
     "strings"
+    "syscall"
     "time"
     "runtime"
     "bytes"
@@ -27,12 +29,13 @@ import (
 
 func main() {
     var (
-        ifaceName string
-        ipsArg    string
-        portsArg  string
-        srcPort   int
-        verbose   bool
-        timeout   int
+        ifaceName    string
+        ipsArg       string
+        portsArg     string
+        srcPort      int
+        verbose      bool
+        retryTimeout time.Duration
+        maxRetries   int
     )
 
     flag.StringVar(&ifaceName, "iface", "", "Network interface to use (mandatory)")
@@ -40,7 +43,8 @@ func main() {
     flag.StringVar(&portsArg, "ports", "1-1024", "Ports to scan, e.g. 80,443,1000-2000")
     flag.IntVar(&srcPort, "srcport", 54321, "Source TCP port to use for SYN packets")
     flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
-    flag.IntVar(&timeout, "timeout", 5, "Seconds to wait after last packet sent before exiting")
+    flag.DurationVar(&retryTimeout, "retry-timeout", 1*time.Second, "Time to wait for a response before retrying a port")
+    flag.IntVar(&maxRetries, "retries", 3, "Number of retries for each port before marking as filtered")
     flag.Parse()
 
     if ifaceName == "" || ipsArg == "" || portsArg == "" {
@@ -65,10 +69,10 @@ func main() {
     }
 
     // Build destination combinations
-    var dests []dest
+    var dests []*dest
     for _, ip := range ips {
         for _, p := range ports {
-            dests = append(dests, dest{ip: ip, port: p})
+            dests = append(dests, &dest{ip: ip, port: p, status: "unknown"})
         }
     }
 
@@ -135,12 +139,27 @@ func main() {
     if err != nil {
         log.Fatalf("NewProgram: %v", err)
     }
-    defer prog.Close()
 
     if err := prog.Attach(link.Attrs().Index); err != nil {
         log.Fatalf("Attach program: %v", err)
     }
-    defer prog.Detach(link.Attrs().Index)
+
+    cleanup := func() {
+        log.Println("Detaching XDP program and closing resources...")
+        if err := prog.Detach(link.Attrs().Index); err != nil {
+            log.Printf("Error detaching XDP program: %v", err)
+        }
+        prog.Close()
+    }
+
+    c := make(chan os.Signal, 2)
+    signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+    go func() {
+        <-(c)
+        cleanup()
+        os.Exit(1)
+    }()
+    defer cleanup()
 
     xsk, err := xdp.NewSocket(link.Attrs().Index, 0, nil)
     if err != nil {
@@ -167,100 +186,106 @@ func main() {
 
     // Pre-fill RX descriptors
     fillDescs := xsk.GetDescs(cap(xsk.GetDescs(0, true)), true)
-    xsk.Fill(fillDescs)
+    if len(fillDescs) > 0 {
+        xsk.Fill(fillDescs)
+    }
 
-    doneTx := make(chan struct{})
-    go func() {
-        runtime.LockOSThread() // keep TX loop on dedicated CPU core
-        // transmitter goroutine
-        idx := 0
-        sent := 0
-        for {
-            // maintain TX completion
-            if c := xsk.NumCompleted(); c > 0 {
-                xsk.Complete(c)
-            }
-
-            nslots := xsk.NumFreeTxSlots()
-            if nslots == 0 {
-                continue
-            }
-            descs := xsk.GetDescs(nslots, false)
-            if len(descs) == 0 {
-                continue
-            }
-            for i := range descs {
-                d := &descs[i]
-                target := dests[idx]
-                idx = (idx + 1) % len(dests)
-                pkt := buildSYN(srcMAC, gatewayMAC, srcIP, srcPort, target)
-                frame := xsk.GetFrame(*d)
-                copy(frame, pkt)
-                d.Len = uint32(len(pkt))
-                sent++
-            }
-            xsk.Transmit(descs)
-
-            if sent >= len(dests) {
-                if verbose {
-                    log.Printf("Transmitted all %d SYNs", sent)
-                }
-                break
-            }
-        }
-        doneTx <- struct{}{}
-    }()
-
-    runtime.LockOSThread() // dedicate RX busy loop to this core
-
-    // Track outstanding
-    outstanding := make(map[string]struct{}, len(dests))
+    // Map to quickly find dest by ip:port string
+    outstanding := make(map[string]*dest, len(dests))
     for _, d := range dests {
         key := fmt.Sprintf("%s:%d", d.ip.String(), d.port)
-        outstanding[key] = struct{}{}
+        outstanding[key] = d
     }
 
-    lastActivity := time.Now()
+    runtime.LockOSThread() // dedicate scanning loop to this core
 
-    for {
-        numRx := xsk.NumReceived()
-        if numRx == 0 {
-            // Hint CPU to reduce power while spinning
-            runtime.Gosched()
+    pendingDests := dests
+    completedCount := 0
 
-            select {
-            case <-doneTx:
-                // wait for timeout after last packet sent
-                if time.Since(lastActivity) > time.Duration(timeout)*time.Second {
-                    if verbose {
-                        log.Printf("Timeout reached, exiting")
+    for len(outstanding) > 0 {
+        // 1. Send packets
+        now := time.Now()
+        descs := xsk.GetDescs(xsk.NumFreeTxSlots(), false)
+        if len(descs) > 0 {
+            packetsToSend := 0
+            for i, d := range descs {
+                if len(pendingDests) == 0 {
+                    break
+                }
+                target := pendingDests[0]
+                pendingDests = pendingDests[1:]
+
+                pkt := buildSYN(srcMAC, gatewayMAC, srcIP, srcPort, *target)
+                frame := xsk.GetFrame(descs[i])
+                copy(frame, pkt)
+                descs[i].Len = uint32(len(pkt))
+                
+                target.lastSent = now
+                target.retries++
+                packetsToSend++
+            }
+            if packetsToSend > 0 {
+                xsk.Transmit(descs[:packetsToSend])
+            }
+        }
+
+        // 2. Receive packets
+        numRx, completed, err := xsk.Poll(100) // 100ms poll timeout
+        if err != nil && err != unix.EAGAIN {
+            log.Printf("Poll error: %v", err)
+        }
+        if completed > 0 {
+            xsk.Complete(completed)
+        }
+
+        if numRx > 0 {
+            rxDescs := xsk.Receive(numRx)
+            for _, d := range rxDescs {
+                frame := xsk.GetFrame(d)
+                if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
+                    key := fmt.Sprintf("%s:%d", ip.String(), port)
+                    if target, ok := outstanding[key]; ok {
+                        target.status = status
+                        delete(outstanding, key)
+                        completedCount++
+                        fmt.Printf("OPEN %s\n", key)
                     }
-                    return
-                }
-            default:
-            }
-            continue
-        }
-        rxDescs := xsk.Receive(numRx)
-        for _, d := range rxDescs {
-            frame := xsk.GetFrame(d)
-            if key := processPacket(frame, srcPort, verbose); key != "" {
-                delete(outstanding, key)
-                if len(outstanding) == 0 {
-                    fmt.Println("Scan complete")
-                    return
                 }
             }
+            xsk.Fill(rxDescs)
         }
-        // Recycle RX descs
-        xsk.Fill(rxDescs)
-        lastActivity = time.Now()
+
+        // 3. Handle timeouts and retries
+        now = time.Now()
+        for key, target := range outstanding {
+            if target.status != "unknown" {
+                continue // Already handled
+            }
+            if now.Sub(target.lastSent) > retryTimeout {
+                if target.retries >= maxRetries {
+                    if verbose {
+                        log.Printf("Filtered: %s", key)
+                    }
+                    target.status = "filtered"
+                    delete(outstanding, key)
+                    completedCount++
+                } else {
+                    // Add to the front of the queue for re-transmission
+                    pendingDests = append([]*dest{target}, pendingDests...)
+                }
+            }
+        }
     }
+
+    log.Printf("Scan complete. %d ports processed.", completedCount)
 }
 
 type dest struct {
-    ip   net.IP
-    port uint16
+    ip       net.IP
+    port     uint16
+    status   string // unknown, open, closed, filtered
+    retries  int
+    lastSent time.Time
 }
 
 func parsePorts(s string) ([]uint16, error) {
@@ -322,97 +347,95 @@ func buildSYN(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int, dst de
 }
 
 // processPacket inspects packet, returns target key if SYN-ACK observed
-func processPacket(pkt []byte, srcPort int, verbose bool) string {
-    if len(pkt) < 34 { // Ethernet + IPv4 min
-        return ""
-    }
-    if pkt[12] != 0x08 || pkt[13] != 0x00 { // not IPv4
-        return ""
-    }
-    ipHeaderLen := (pkt[14] & 0x0F) * 4
-    if len(pkt) < int(14+ipHeaderLen+20) {
-        return ""
-    }
-    proto := pkt[23]
-    if proto != 6 { // TCP
-        return ""
-    }
-    tcpStart := 14 + ipHeaderLen
-    srcPortPkt := int(pkt[tcpStart])<<8 | int(pkt[tcpStart+1])
-    dstPortPkt := int(pkt[tcpStart+2])<<8 | int(pkt[tcpStart+3])
-    if dstPortPkt != srcPort { // only care replies to our src port
-        return ""
-    }
-    flags := pkt[tcpStart+13]
-    if flags&0x12 == 0x12 { // SYN+ACK
-        srcIP := net.IPv4(pkt[26], pkt[27], pkt[28], pkt[29])
-        result := fmt.Sprintf("%s:%d", srcIP.String(), srcPortPkt)
-        fmt.Printf("OPEN %s\n", result)
-        return result
-    }
-    if verbose {
-        // log non-SYN ACK responses for debugging
-        srcIP := net.IPv4(pkt[26], pkt[27], pkt[28], pkt[29])
-        if proto == 6 {
-            srcPortPkt := int(pkt[14+ipHeaderLen])<<8 | int(pkt[14+ipHeaderLen+1])
-            fmt.Printf("DEBUG reply flags %02x from %s:%d\n", pkt[14+ipHeaderLen+13], srcIP.String(), srcPortPkt)
-        }
-    }
-    return ""
+func processPacket(pkt []byte, srcPort int, verbose bool) (ip net.IP, port uint16, status string) {
+	if len(pkt) < 34 { // Ethernet + IPv4 min
+		return
+	}
+	if pkt[12] != 0x08 || pkt[13] != 0x00 { // not IPv4
+		return
+	}
+	ipHeaderLen := (pkt[14] & 0x0F) * 4
+	if len(pkt) < int(14+ipHeaderLen+20) {
+		return
+	}
+	proto := pkt[23]
+	if proto != 6 { // TCP
+		return
+	}
+	tcpStart := 14 + ipHeaderLen
+	srcPortPkt := int(pkt[tcpStart])<<8 | int(pkt[tcpStart+1])
+	dstPortPkt := int(pkt[tcpStart+2])<<8 | int(pkt[tcpStart+3])
+	if dstPortPkt != srcPort { // only care replies to our src port
+		return
+	}
+	flags := pkt[tcpStart+13]
+	srcIP := net.IPv4(pkt[26], pkt[27], pkt[28], pkt[29])
+
+	if flags&0x12 == 0x12 { // SYN+ACK
+		return srcIP, uint16(srcPortPkt), "open"
+	}
+	if flags&0x14 == 0x14 || flags&0x04 == 0x04 { // RST+ACK or RST
+		return srcIP, uint16(srcPortPkt), "closed"
+	}
+	if verbose {
+		// log non-SYN ACK responses for debugging
+		fmt.Printf("DEBUG reply flags %02x from %s:%d\n", flags, srcIP.String(), srcPortPkt)
+	}
+	return
 }
 
 func getGatewayMAC(ifaceName string, srcIP, gatewayIP net.IP, verbose bool) (net.HardwareAddr, error) {
-    iface, err := net.InterfaceByName(ifaceName)
-    if err != nil {
-        return nil, err
-    }
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return nil, err
+	}
 
-    handle, err := pcap.OpenLive(ifaceName, 1024, true, 3*time.Second)
-    if err != nil {
-        return nil, fmt.Errorf("pcap open live failed: %w", err)
-    }
-    defer handle.Close()
+	handle, err := pcap.OpenLive(ifaceName, 1024, true, 3*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("pcap open live failed: %w", err)
+	}
+	defer handle.Close()
 
-    // Create ARP request
-    eth := layers.Ethernet{
-        SrcMAC:       iface.HardwareAddr,
-        DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // Broadcast
-        EthernetType: layers.EthernetTypeARP,
-    }
-    arp := layers.ARP{
-        AddrType:          layers.LinkTypeEthernet,
-        Protocol:          layers.EthernetTypeIPv4,
-        HwAddressSize:     6,
-        ProtAddressSize:   4,
-        Operation:         layers.ARPRequest,
-        SourceHwAddress:   []byte(iface.HardwareAddr),
-        SourceProtAddress: []byte(srcIP.To4()),
-        DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
-        DstProtAddress:    []byte(gatewayIP.To4()),
-    }
+	// Create ARP request
+	eth := layers.Ethernet{
+		SrcMAC:       iface.HardwareAddr,
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // Broadcast
+		EthernetType: layers.EthernetTypeARP,
+	}
+	arp := layers.ARP{
+		AddrType:          layers.LinkTypeEthernet,
+		Protocol:          layers.EthernetTypeIPv4,
+		HwAddressSize:     6,
+		ProtAddressSize:   4,
+		Operation:         layers.ARPRequest,
+		SourceHwAddress:   []byte(iface.HardwareAddr),
+		SourceProtAddress: []byte(srcIP.To4()),
+		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+		DstProtAddress:    []byte(gatewayIP.To4()),
+	}
 
-    buf := gopacket.NewSerializeBuffer()
-    opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-    gopacket.SerializeLayers(buf, opts, &eth, &arp)
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	gopacket.SerializeLayers(buf, opts, &eth, &arp)
 
-    if verbose {
-        log.Println("Sending ARP request for gateway")
-    }
-    if err := handle.WritePacketData(buf.Bytes()); err != nil {
-        return nil, err
-    }
+	if verbose {
+		log.Println("Sending ARP request for gateway")
+	}
+	if err := handle.WritePacketData(buf.Bytes()); err != nil {
+		return nil, err
+	}
 
-    // Listen for ARP reply
-    packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-    for packet := range packetSource.Packets() {
-        if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
-            arp, _ := arpLayer.(*layers.ARP)
-            if arp.Operation == layers.ARPReply && bytes.Equal(arp.SourceProtAddress, []byte(gatewayIP.To4())) {
-                return net.HardwareAddr(arp.SourceHwAddress), nil
-            }
-        }
-    }
-    return nil, fmt.Errorf("ARP reply not received from gateway")
+	// Listen for ARP reply
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	for packet := range packetSource.Packets() {
+		if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
+			arp, _ := arpLayer.(*layers.ARP)
+			if arp.Operation == layers.ARPReply && bytes.Equal(arp.SourceProtAddress, []byte(gatewayIP.To4())) {
+				return net.HardwareAddr(arp.SourceHwAddress), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("ARP reply not received from gateway")
 }
 
 type defaultRouteInfo struct {
