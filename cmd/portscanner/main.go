@@ -170,7 +170,7 @@ func main() {
     l, err := link.AttachXDP(link.XDPOptions{
         Program:   prog,
         Interface: iface.Attrs().Index,
-        Flags:     xdp.DefaultXdpFlags,
+        Flags:     link.XDPAttachFlags(xdp.DefaultXdpFlags),
     })
     if err != nil {
         log.Fatalf("could not attach XDP program: %v", err)
