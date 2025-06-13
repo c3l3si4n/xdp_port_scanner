@@ -4,6 +4,11 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 
+// IMPORTANT: This is the hardcoded source port for filtering.
+// If you change the -srcport flag in the Go program, you MUST
+// change this value to match and recompile this eBPF program.
+#define FILTER_PORT 54321
+
 /*
  * This is the XSK map, which is used to redirect packets to a userspace
  * socket. The key is the queue ID, and the value is the socket's file
@@ -13,16 +18,8 @@ struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
 	__uint(key_size, sizeof(__u32));
 	__uint(value_size, sizeof(__u32));
-	__uint(max_entries, 1);
+	__uint(max_entries, 1); // Only using queue 0
 } xsks_map SEC(".maps");
-
-/*
- * This variable will be set from userspace. It holds the TCP port number
- * that we want to filter for. The `volatile` and `const` keywords are
- * hints to the compiler to prevent it from optimizing away this variable,
- * allowing it to be modified before the program is loaded.
- */
-volatile const __u16 filter_port = 0;
 
 SEC("xdp")
 int xdp_port_filter(struct xdp_md *ctx) {
@@ -56,8 +53,8 @@ int xdp_port_filter(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 
-	// If the destination port matches our filter, redirect to the socket
-	if (tcp->dest == __bpf_htons(filter_port)) {
+	// Filter for packets destined to our source port
+	if (tcp->dest == __bpf_htons(FILTER_PORT)) {
 		return bpf_redirect_map(&xsks_map, 0, 0);
 	}
 

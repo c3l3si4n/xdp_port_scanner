@@ -7,8 +7,7 @@ CLANG ?= clang
 TARGET_ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 CFLAGS = -O2 -g -Wall -Werror -target bpf -D__TARGET_ARCH_$(TARGET_ARCH)
 
-# Get the path to the system's BPF header files
-# This is a common location, but may vary.
+# This path may need to be adjusted depending on your system
 BPF_INCLUDE_PATH ?= /usr/include/bpf
 
 all: xdp_filter.o
