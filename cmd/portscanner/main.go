@@ -520,7 +520,59 @@ func processPacket(pkt []byte, srcPort int, verbose bool) (ip net.IP, port uint1
 	return
 }
 
+// getMACFromCache reads the system's ARP table to find the MAC address for a given IP.
+// This is much faster than sending an ARP request.
+func getMACFromCache(ifaceName string, ip net.IP, verbose bool) (net.HardwareAddr, error) {
+	file, err := os.Open("/proc/net/arp")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Scan() // Skip header
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+
+		// Line format: IP address, HW type, Flags, HW address, Mask, Device
+		if fields[0] == ip.String() && fields[5] == ifaceName {
+			// Check if the entry is complete (flag 0x2)
+			if fields[2] == "0x2" {
+				mac, err := net.ParseMAC(fields[3])
+				if err == nil {
+					return mac, nil
+				}
+				if verbose {
+					log.Printf("Invalid MAC '%s' in ARP cache for IP %s", fields[3], ip)
+				}
+			}
+		}
+	}
+	return nil, scanner.Err() // Not found or scanner error
+}
+
 func getGatewayMAC(ifaceName string, srcIP, gatewayIP net.IP, verbose bool) (net.HardwareAddr, error) {
+	// 1. Try to read from ARP cache first for a significant speedup.
+	mac, err := getMACFromCache(ifaceName, gatewayIP, verbose)
+	if err != nil && verbose {
+		log.Printf("Could not read from ARP cache: %v. Will send ARP request.", err)
+	}
+	if mac != nil {
+		if verbose {
+			log.Printf("Resolved gateway MAC from cache: %s", mac)
+		}
+		return mac, nil
+	}
+
+	if verbose {
+		log.Println("Gateway MAC not in cache, sending ARP request.")
+	}
+
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, err
@@ -554,9 +606,6 @@ func getGatewayMAC(ifaceName string, srcIP, gatewayIP net.IP, verbose bool) (net
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 	gopacket.SerializeLayers(buf, opts, &eth, &arp)
 
-	if verbose {
-		log.Println("Sending ARP request for gateway")
-	}
 	if err := handle.WritePacketData(buf.Bytes()); err != nil {
 		return nil, err
 	}
