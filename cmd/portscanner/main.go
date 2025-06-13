@@ -254,9 +254,25 @@ func main() {
     var retryDests []*dest
     var retryNextIndex int
 
+    // Create the packet packer
+    packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort)
+    if err != nil {
+        log.Fatalf("failed to create syn packet generator: %v", err)
+    }
+    pktBuf := make([]byte, len(packer.template))
+
+    // Use a periodic timer for timeout checks to reduce overhead.
+    timeoutCheckInterval := 100 * time.Millisecond
+    nextTimeoutCheck := time.Now().Add(timeoutCheckInterval)
+
+    frameMem := make([][]byte, socketOptions.TxRingNumDescs)
+    for i := range frameMem {
+        frameMem[i] = make([]byte, len(packer.template))
+    }
+
+    var seq uint32
     for len(outstanding) > 0 {
         // 1. Send packets
-        now := time.Now()
         descs := xsk.GetDescs(xsk.NumFreeTxSlots(), false)
         if len(descs) > 0 {
             packetsToSend := 0
@@ -281,12 +297,13 @@ func main() {
 
                 target.isQueued = false
 
-                pkt := buildSYN(srcMAC, gatewayMAC, srcIP, srcPort, *target)
-                frame := xsk.GetFrame(descs[i])
-                copy(frame, pkt)
-                descs[i].Len = uint32(len(pkt))
+                buf := frameMem[i]
+                seq += 0x01000193 // FNV prime, any odd increment works
+                packer.pack(buf, target.ip, target.port, seq)
+                copy(buf, pktBuf)
+                descs[i].Len = uint32(len(pktBuf))
 
-                target.lastSent = now
+                target.lastSent = time.Now()
                 target.retries++
                 packetsToSend++
             }
@@ -332,33 +349,36 @@ func main() {
             xsk.Fill(rxDescs)
         }
 
-        // 3. Handle timeouts and retries
-        now = time.Now()
-        for key, target := range outstanding {
-            if target.status != "unknown" {
-                continue // Already handled
-            }
-            // Don't check timeout for something that was never sent
-            if target.lastSent.IsZero() {
-                continue
-            }
+        // 3. Handle timeouts and retries periodically instead of on every loop.
+        now := time.Now()
+        if now.After(nextTimeoutCheck) {
+            for key, target := range outstanding {
+                if target.status != "unknown" {
+                    continue // Already handled
+                }
+                // Don't check timeout for something that was never sent
+                if target.lastSent.IsZero() {
+                    continue
+                }
 
-            if now.Sub(target.lastSent) > retryTimeout {
-                if target.retries >= maxRetries {
-                    if verbose {
-                        log.Printf("Filtered: %s", key)
-                    }
-                    target.status = "filtered"
-                    delete(outstanding, key)
-                    atomic.AddUint64(&completedCount, 1)
-                } else {
-                    if !target.isQueued {
-                        // Add to the queue for re-transmission
-                        retryDests = append(retryDests, target)
-                        target.isQueued = true
+                if now.Sub(target.lastSent) > retryTimeout {
+                    if target.retries >= maxRetries {
+                        if verbose {
+                            log.Printf("Filtered: %s", key)
+                        }
+                        target.status = "filtered"
+                        delete(outstanding, key)
+                        atomic.AddUint64(&completedCount, 1)
+                    } else {
+                        if !target.isQueued {
+                            // Add to the queue for re-transmission
+                            retryDests = append(retryDests, target)
+                            target.isQueued = true
+                        }
                     }
                 }
             }
+            nextTimeoutCheck = now.Add(timeoutCheckInterval)
         }
     }
 
@@ -451,35 +471,6 @@ func parsePorts(s string) ([]uint16, error) {
         }
     }
     return res, nil
-}
-
-func buildSYN(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int, dst dest) []byte {
-    eth := &layers.Ethernet{
-        SrcMAC:       srcMAC,
-        DstMAC:       dstMAC,
-        EthernetType: layers.EthernetTypeIPv4,
-    }
-    ip := &layers.IPv4{
-        Version:  4,
-        IHL:      5,
-        TTL:      64,
-        Protocol: layers.IPProtocolTCP,
-        SrcIP:    srcIP,
-        DstIP:    dst.ip,
-    }
-    tcp := &layers.TCP{
-        SrcPort: layers.TCPPort(srcPort),
-        DstPort: layers.TCPPort(dst.port),
-        Seq:     rand.Uint32(),
-        SYN:     true,
-        Window:  14600,
-    }
-    tcp.SetNetworkLayerForChecksum(ip)
-
-    buf := gopacket.NewSerializeBuffer()
-    opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
-    _ = gopacket.SerializeLayers(buf, opts, eth, ip, tcp)
-    return buf.Bytes()
 }
 
 // processPacket inspects packet, returns target key if SYN-ACK observed
@@ -685,4 +676,135 @@ func getDefaultRoutes(verbose bool) ([]defaultRouteInfo, error) {
     }
 
     return routes, nil
+}
+
+// synPacker is used to quickly craft SYN packets by creating a template and
+// only modifying the necessary fields for each new packet.
+type synPacker struct {
+	template          []byte
+	ethHeaderLen      int
+	ipHeaderLen       int
+	ipDstOffset       int
+	tcpDstPortOffset  int
+	tcpSeqOffset      int
+	ipChecksumOffset  int
+	tcpChecksumOffset int
+	pseudoHeader      []byte
+}
+
+func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*synPacker, error) {
+	eth := &layers.Ethernet{
+		SrcMAC:       srcMAC,
+		DstMAC:       dstMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolTCP,
+		SrcIP:    srcIP,
+		DstIP:    net.IP{127, 0, 0, 1}, // Placeholder
+	}
+	tcp := &layers.TCP{
+		SrcPort: layers.TCPPort(srcPort),
+		DstPort: layers.TCPPort(80), // Placeholder
+		Seq:     12345,              // Placeholder
+		SYN:     true,
+		Window:  1024,
+	}
+	// DstIP in ip is a placeholder, but for checksum calculation it's fine.
+	tcp.SetNetworkLayerForChecksum(ip)
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip, tcp); err != nil {
+		return nil, fmt.Errorf("serialize template packet: %w", err)
+	}
+
+	packetBytes := buf.Bytes()
+	decodedPacket := gopacket.NewPacket(packetBytes, layers.LayerTypeEthernet, gopacket.NoCopy)
+	ipLayer := decodedPacket.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	tcpLayer := decodedPacket.Layer(layers.LayerTypeTCP).(*layers.TCP)
+
+	ethHeaderLen := len(decodedPacket.Layer(layers.LayerTypeEthernet).LayerContents())
+	ipHeaderLen := int(ipLayer.IHL * 4)
+
+	p := &synPacker{
+		template:          packetBytes,
+		ethHeaderLen:      ethHeaderLen,
+		ipHeaderLen:       ipHeaderLen,
+		ipDstOffset:       ethHeaderLen + 16,                // DstIP is at byte 16 of IP header
+		tcpDstPortOffset:  ethHeaderLen + ipHeaderLen + 2,   // DstPort is at byte 2 of TCP header
+		tcpSeqOffset:      ethHeaderLen + ipHeaderLen + 4,   // Seq is at byte 4
+		ipChecksumOffset:  ethHeaderLen + 10,                // Checksum is at byte 10 of IP header
+		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16,  // Checksum is at byte 16 of TCP header
+		pseudoHeader:      ipLayer.Pseudoheader(),
+	}
+	
+	binary.BigEndian.PutUint16(p.pseudoHeader[10:], uint16(len(tcpLayer.Contents)))
+
+	return p, nil
+}
+
+// pack quickly constructs a packet by modifying the template.
+func (p *synPacker) pack(pktBuf []byte, dstIP net.IP, dstPort uint16, seq uint32) {
+	copy(pktBuf, p.template)
+	copy(pktBuf[p.ipDstOffset:p.ipDstOffset+4], dstIP.To4())
+	binary.BigEndian.PutUint16(pktBuf[p.tcpDstPortOffset:p.tcpDstPortOffset+2], dstPort)
+	binary.BigEndian.PutUint32(pktBuf[p.tcpSeqOffset:p.tcpSeqOffset+4], seq)
+
+	// Update pseudoheader with correct dstIP
+	copy(p.pseudoHeader[4:8], dstIP.To4())
+
+	// Clear checksums before recalculating
+	binary.BigEndian.PutUint16(pktBuf[p.ipChecksumOffset:p.ipChecksumOffset+2], 0)
+	binary.BigEndian.PutUint16(pktBuf[p.tcpChecksumOffset:p.tcpChecksumOffset+2], 0)
+
+	// Calculate IP checksum
+	ipChecksum := checksum(pktBuf[p.ethHeaderLen : p.ethHeaderLen+p.ipHeaderLen])
+	binary.BigEndian.PutUint16(pktBuf[p.ipChecksumOffset:p.ipChecksumOffset+2], ipChecksum)
+
+	// Calculate TCP checksum
+	tcpPayload := pktBuf[p.ethHeaderLen+p.ipHeaderLen:]
+	tcpChecksum := tcpChecksum(p.pseudoHeader, tcpPayload)
+	binary.BigEndian.PutUint16(pktBuf[p.tcpChecksumOffset:p.tcpChecksumOffset+2], tcpChecksum)
+}
+
+// checksum calculates the IP checksum.
+func checksum(buf []byte) uint16 {
+	sum := uint32(0)
+	for ; len(buf) >= 2; buf = buf[2:] {
+		sum += uint32(binary.BigEndian.Uint16(buf[:2]))
+	}
+	if len(buf) == 1 {
+		sum += uint32(buf[0]) << 8
+	}
+	for sum>>16 > 0 {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// tcpChecksum calculates the TCP checksum.
+func tcpChecksum(pseudoHeader, tcpSegment []byte) uint16 {
+	sum := uint32(0)
+
+	// Pseudo-header
+	for i := 0; i < len(pseudoHeader)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(pseudoHeader[i:]))
+	}
+
+	// TCP segment
+	for i := 0; i < len(tcpSegment)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(tcpSegment[i:]))
+	}
+	if len(tcpSegment)%2 == 1 {
+		sum += uint32(tcpSegment[len(tcpSegment)-1]) << 8
+	}
+
+	for sum>>16 > 0 {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
 } 
