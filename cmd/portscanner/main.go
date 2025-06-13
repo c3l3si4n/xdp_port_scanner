@@ -259,7 +259,6 @@ func main() {
     if err != nil {
         log.Fatalf("failed to create syn packet generator: %v", err)
     }
-    pktBuf := make([]byte, len(packer.template))
 
     // Use a periodic timer for timeout checks to reduce overhead.
     timeoutCheckInterval := 100 * time.Millisecond
@@ -297,11 +296,15 @@ func main() {
 
                 target.isQueued = false
 
+                // Use one of the pre-allocated buffers
                 buf := frameMem[i]
                 seq += 0x01000193 // FNV prime, any odd increment works
                 packer.pack(buf, target.ip, target.port, seq)
-                copy(buf, pktBuf)
-                descs[i].Len = uint32(len(pktBuf))
+
+                // Copy the crafted packet into the XDP frame for transmission
+                frame := xsk.GetFrame(descs[i])
+                copy(frame, buf)
+                descs[i].Len = uint32(len(buf))
 
                 target.lastSent = time.Now()
                 target.retries++
@@ -730,19 +733,27 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*
 	ethHeaderLen := len(decodedPacket.Layer(layers.LayerTypeEthernet).LayerContents())
 	ipHeaderLen := int(ipLayer.IHL * 4)
 
+	// Manually construct the pseudo-header for checksum calculation, as
+	// gopacket does not expose this directly.
+	pseudoHeader := make([]byte, 12)
+	copy(pseudoHeader[0:4], ipLayer.SrcIP.To4())
+	copy(pseudoHeader[4:8], ipLayer.DstIP.To4()) // DstIP is a placeholder
+	pseudoHeader[8] = 0                          // Reserved
+	pseudoHeader[9] = byte(layers.IPProtocolTCP)
+	tcpLen := uint16(len(tcpLayer.Contents) + len(tcpLayer.Payload))
+	binary.BigEndian.PutUint16(pseudoHeader[10:12], tcpLen)
+
 	p := &synPacker{
 		template:          packetBytes,
 		ethHeaderLen:      ethHeaderLen,
 		ipHeaderLen:       ipHeaderLen,
-		ipDstOffset:       ethHeaderLen + 16,                // DstIP is at byte 16 of IP header
-		tcpDstPortOffset:  ethHeaderLen + ipHeaderLen + 2,   // DstPort is at byte 2 of TCP header
-		tcpSeqOffset:      ethHeaderLen + ipHeaderLen + 4,   // Seq is at byte 4
-		ipChecksumOffset:  ethHeaderLen + 10,                // Checksum is at byte 10 of IP header
-		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16,  // Checksum is at byte 16 of TCP header
-		pseudoHeader:      ipLayer.Pseudoheader(),
+		ipDstOffset:       ethHeaderLen + 16,               // DstIP is at byte 16 of IP header
+		tcpDstPortOffset:  ethHeaderLen + ipHeaderLen + 2,  // DstPort is at byte 2 of TCP header
+		tcpSeqOffset:      ethHeaderLen + ipHeaderLen + 4,  // Seq is at byte 4
+		ipChecksumOffset:  ethHeaderLen + 10,               // Checksum is at byte 10 of IP header
+		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16, // Checksum is at byte 16 of TCP header
+		pseudoHeader:      pseudoHeader,
 	}
-	
-	binary.BigEndian.PutUint16(p.pseudoHeader[10:], uint16(len(tcpLayer.Contents)))
 
 	return p, nil
 }
