@@ -56,13 +56,9 @@ func main() {
     }
 
     // Parse IPs
-    var ips []net.IP
-    for _, s := range strings.Split(ipsArg, ",") {
-        ip := net.ParseIP(strings.TrimSpace(s)).To4()
-        if ip == nil {
-            log.Fatalf("invalid/unsupported IP: %s", s)
-        }
-        ips = append(ips, ip)
+    ips, err := parseIPsAndCIDRs(ipsArg)
+    if err != nil {
+        log.Fatalf("could not parse 'ips' argument: %v", err)
     }
 
     // Parse ports
@@ -127,7 +123,7 @@ func main() {
     }
 
     log.Printf("Found default gateway: %s", gatewayIP)
-
+ 
     gatewayMAC, err := getGatewayMAC(ifaceName, srcIP, gatewayIP, verbose)
     if err != nil {
         log.Fatalf("Could not resolve gateway MAC: %v. Please ensure you are running with sufficient privileges and you can ping the gateway.", err)
@@ -367,6 +363,56 @@ func main() {
     }
 
     log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.", atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
+}
+
+func parseIPsAndCIDRs(s string) ([]net.IP, error) {
+    var ips []net.IP
+    for _, part := range strings.Split(s, ",") {
+        part = strings.TrimSpace(part)
+        if strings.Contains(part, "/") {
+            // CIDR
+            _, ipnet, err := net.ParseCIDR(part)
+            if err != nil {
+                return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
+            }
+            if ipnet.IP.To4() == nil {
+                return nil, fmt.Errorf("only IPv4 CIDRs are supported: %q", part)
+            }
+
+            // Iterate over all IPs in the network.
+            for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+                // Create a copy of the IP and add it to the list.
+                addr := make(net.IP, len(ip))
+                copy(addr, ip)
+                ips = append(ips, addr.To4())
+            }
+        } else {
+            // Single IP
+            ip := net.ParseIP(part)
+            if ip == nil {
+                return nil, fmt.Errorf("invalid IP address: %q", part)
+            }
+            ip = ip.To4()
+            if ip == nil {
+                return nil, fmt.Errorf("only IPv4 addresses are supported: %q", part)
+            }
+            ips = append(ips, ip)
+        }
+    }
+    if len(ips) == 0 {
+        return nil, fmt.Errorf("no valid IPs or CIDRs found")
+    }
+    return ips, nil
+}
+
+// inc increments an IP address. It is used to iterate over a CIDR range.
+func inc(ip net.IP) {
+    for j := len(ip) - 1; j >= 0; j-- {
+        ip[j]++
+        if ip[j] > 0 {
+            break
+        }
+    }
 }
 
 type dest struct {
