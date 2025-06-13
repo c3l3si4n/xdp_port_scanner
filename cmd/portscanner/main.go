@@ -26,7 +26,13 @@ import (
     "github.com/slavc/xdp"
     "github.com/vishvananda/netlink"
     "golang.org/x/sys/unix"
+    "github.com/cilium/ebpf"
+    "github.com/cilium/ebpf/link"
+    "github.com/cilium/ebpf/rlimit"
 )
+
+//go:embed bpf/xdp_filter.o
+var bpfObj []byte
 
 func main() {
     var (
@@ -133,22 +139,48 @@ func main() {
     // Set SKB mode
     xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
 
-    // Prepare XDP program and socket
-    prog, err := xdp.NewProgram(1) // queue 0 only
-    if err != nil {
-        log.Fatalf("NewProgram: %v", err)
+    // Allow the eBPF subsystem to allocate memory
+    if err := rlimit.RemoveMemlock(); err != nil {
+        log.Fatalf("could not remove memlock rlimit: %v", err)
     }
 
-    if err := prog.Attach(link.Attrs().Index); err != nil {
-        log.Fatalf("Attach program: %v", err)
+    // Load the eBPF program
+    spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfObj))
+    if err != nil {
+        log.Fatalf("could not load eBPF spec: %v", err)
     }
+
+    // Set the source port in the eBPF program's constant variable.
+    if err := spec.RewriteConstants(map[string]interface{}{"filter_port": uint16(srcPort)}); err != nil {
+        log.Fatalf("could not rewrite eBPF constants: %v", err)
+    }
+
+    coll, err := ebpf.NewCollection(spec)
+    if err != nil {
+        log.Fatalf("could not create eBPF collection: %v", err)
+    }
+    defer coll.Close()
+
+    prog := coll.Programs["xdp_port_filter"]
+    if prog == nil {
+        log.Fatal("no xdp_port_filter program found")
+    }
+
+    // Attach the XDP program to the interface
+    l, err := link.AttachXDP(link.XDPOptions{
+        Program:   prog,
+        Interface: link.Attrs().Index,
+        Flags:     xdp.DefaultXdpFlags,
+    })
+    if err != nil {
+        log.Fatalf("could not attach XDP program: %v", err)
+    }
+    defer l.Close()
+
+    log.Printf("Attached XDP program %s to interface %s", prog.String(), ifaceName)
 
     cleanup := func() {
         log.Println("Detaching XDP program and closing resources...")
-        if err := prog.Detach(link.Attrs().Index); err != nil {
-            log.Printf("Error detaching XDP program: %v", err)
-        }
-        prog.Close()
     }
 
     c := make(chan os.Signal, 2)
@@ -177,8 +209,17 @@ func main() {
     }
     defer xsk.Close()
 
-    if err := prog.Register(0, xsk.FD()); err != nil {
-        log.Fatalf("Register socket in program: %v", err)
+    // Get the map for the XDP sockets
+    xsksMap := coll.Maps["xsks_map"]
+    if xsksMap == nil {
+        log.Fatal("no xsks_map found")
+    }
+
+    // Put the socket file descriptor into the map at key 0 (queue 0)
+    key := uint32(0)
+    val := uint32(xsk.FD())
+    if err := xsksMap.Put(&key, &val); err != nil {
+        log.Fatalf("could not put socket FD in xsks_map: %v", err)
     }
 
     // Enable kernel busy polling on this socket (microseconds) and prefer busy poll
