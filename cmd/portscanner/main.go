@@ -82,7 +82,7 @@ func main() {
     }
 
     // Get link info
-    link, err := netlink.LinkByName(ifaceName)
+    iface, err := netlink.LinkByName(ifaceName)
     if err != nil {
         log.Fatalf("netlink.LinkByName: %v", err)
     }
@@ -169,7 +169,7 @@ func main() {
     // Attach the XDP program to the interface
     l, err := link.AttachXDP(link.XDPOptions{
         Program:   prog,
-        Interface: link.Attrs().Index,
+        Interface: iface.Attrs().Index,
         Flags:     xdp.DefaultXdpFlags,
     })
     if err != nil {
@@ -203,7 +203,7 @@ func main() {
         TxRingNumDescs:         4096,
     }
 
-    xsk, err := xdp.NewSocket(link.Attrs().Index, 0, &socketOptions)
+    xsk, err := xdp.NewSocket(iface.Attrs().Index, 0, &socketOptions)
     if err != nil {
         log.Fatalf("NewSocket: %v", err)
     }

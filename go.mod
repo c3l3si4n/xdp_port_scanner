@@ -10,6 +10,6 @@ require (
 )
 
 require (
-	github.com/cilium/ebpf v0.4.0 // indirect
+	github.com/cilium/ebpf v0.9.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 )
