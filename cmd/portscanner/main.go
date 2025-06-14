@@ -136,9 +136,6 @@ func main() {
 
 	log.Printf("Found default gateway: %s", gatewayIP)
 
-	// Check for and enable hardware checksum offloading for performance.
-	// Fall back to software checksums if it's not available.
-	useHwChecksum := checkAndEnableChecksumOffloading(ifaceName, verbose)
 
 	gatewayMAC, err := getGatewayMAC(ifaceName, srcIP, gatewayIP, verbose)
 	if err != nil {
@@ -262,7 +259,7 @@ func main() {
 	}
 
 	// Stats tracking
-	var totalTx, totalRx, completedCount, openCount, closedCount uint64
+	var totalTx, totalRx, completedCount, openCount, closedCount, rawPacketCount uint64
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -374,7 +371,6 @@ func main() {
 	// run at full speed without being blocked by receive logic.
 	var receiverWg sync.WaitGroup
 	receiverWg.Add(1)
-	var rawPacketCount uint64
 	go func() {
 		defer receiverWg.Done()
 		runtime.LockOSThread() // Dedicate a core to receiving
@@ -414,10 +410,10 @@ func main() {
 										fmt.Printf("CLOSED: %s\n", key)
 									}
 								}
+								processedPackets++
 							}
 						}
 						outstandingMu.Unlock()
-						processedPackets++
 					}
 				}
 				atomic.AddUint64(&totalRx, uint64(processedPackets))
