@@ -146,8 +146,12 @@ func main() {
 	}
 	log.Printf("Resolved gateway MAC: %s", gatewayMAC)
 
+	// Hardware checksum offloading has been disabled by user request.
+	// The scanner will now calculate checksums in software.
+
 	// done channel for graceful shutdown
 	done := make(chan struct{})
+	var closeOnce sync.Once
 
 	// Set SKB mode
 	xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
@@ -160,7 +164,11 @@ func main() {
 		log.Fatalf("could not load XDP program: %v. \nHave you compiled it with `make` in `cmd/portscanner/bpf/`?", err)
 	}
 	log.Printf("Loaded XDP program from bpf/xdp_filter.o")
-	log.Printf("IMPORTANT: The BPF program filters for destination port %d. If you use the -srcport flag, make sure it matches the value in bpf/xdp_filter.c", 54321)
+	log.Println("====================================================================================")
+	log.Printf("!! IMPORTANT: The BPF program filters for incoming packets on a specific port.")
+	log.Printf("!! This port MUST match the -srcport flag (current: %d).", srcPort)
+	log.Printf("!! Check FILTER_PORT in 'bpf/xdp_filter.c' and recompile if necessary.")
+	log.Println("====================================================================================")
 
 	if err := prog.Attach(iface.Attrs().Index); err != nil {
 		log.Fatalf("Attach program: %v", err)
@@ -184,10 +192,10 @@ func main() {
 
 	cleanup := func() {
 		log.Println("Detaching XDP program and closing resources...")
-		// Close the socket first. This signals to the kernel that userspace is
-		// no longer listening, which allows the detach operation to proceed
-		// without hanging.
-		xsk.Close()
+		// Use sync.Once to ensure the socket is closed exactly once.
+		closeOnce.Do(func() {
+			xsk.Close()
+		})
 
 		// Detach the XDP program by running `ip link` commands. This is often more
 		// reliable than library calls, especially when using SKB_MODE.
@@ -275,6 +283,7 @@ func main() {
 
 				currentTx := atomic.LoadUint64(&totalTx)
 				currentRx := atomic.LoadUint64(&totalRx)
+				rawRx := atomic.LoadUint64(&rawPacketCount)
 				currentCompleted := atomic.LoadUint64(&completedCount)
 				currentOpen := atomic.LoadUint64(&openCount)
 				currentClosed := atomic.LoadUint64(&closedCount)
@@ -283,8 +292,8 @@ func main() {
 				rxPps := float64(currentRx-lastRx) / elapsed.Seconds()
 				scansPerSec := float64(currentCompleted-lastCompleted) / elapsed.Seconds()
 
-				log.Printf("Stats: TX %.0f pps, RX %.0f pps, Scans %.0f/s | Outstanding: %d | Open: %d, Closed: %d",
-					txPps, rxPps, scansPerSec, len(outstanding), currentOpen, currentClosed)
+				log.Printf("Stats: TX %.0f pps, RX %.0f pps (Raw: %d), Scans %.0f/s | Outstanding: %d | Open: %d, Closed: %d",
+					txPps, rxPps, rawRx, scansPerSec, len(outstanding), currentOpen, currentClosed)
 
 				lastTx = currentTx
 				lastRx = currentRx
@@ -310,7 +319,7 @@ func main() {
 	timeoutChan := make(chan *dest, BATCH_SIZE*2) // Buffered channel for destinations that timed out
 
 	// Create the packet packer
-	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort, useHwChecksum)
+	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort)
 	if err != nil {
 		log.Fatalf("failed to create syn packet generator: %v", err)
 	}
@@ -365,6 +374,7 @@ func main() {
 	// run at full speed without being blocked by receive logic.
 	var receiverWg sync.WaitGroup
 	receiverWg.Add(1)
+	var rawPacketCount uint64
 	go func() {
 		defer receiverWg.Done()
 		runtime.LockOSThread() // Dedicate a core to receiving
@@ -382,8 +392,9 @@ func main() {
 			}
 
 			if numRx > 0 {
+				atomic.AddUint64(&rawPacketCount, uint64(numRx))
 				rxDescs := xsk.Receive(numRx)
-				atomic.AddUint64(&totalRx, uint64(len(rxDescs)))
+				processedPackets := 0
 				for _, d := range rxDescs {
 					frame := xsk.GetFrame(d)
 					if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
@@ -406,11 +417,16 @@ func main() {
 							}
 						}
 						outstandingMu.Unlock()
+						processedPackets++
 					}
 				}
+				atomic.AddUint64(&totalRx, uint64(processedPackets))
 				xsk.Fill(rxDescs)
 			}
-			if len(outstanding) == 0 {
+			outstandingMu.RLock()
+			outstandingCount := len(outstanding)
+			outstandingMu.RUnlock()
+			if outstandingCount == 0 {
 				break
 			}
 		}
@@ -513,13 +529,15 @@ func main() {
 	close(done)
 	// The receiver goroutine uses a blocking poll, so we need to close the socket
 	// here to unblock it and allow it to exit gracefully.
-	xsk.Close()
+	closeOnce.Do(func() {
+		xsk.Close()
+	})
 	close(timeoutChan) // Close the timeout channel to signal the goroutine to exit
 	// Wait for the stats goroutine to finish to avoid data races on log/stdout.
 	wg.Wait()
 	timeoutWg.Wait()     // Wait for the timeout goroutine to finish
 	receiverWg.Wait()    // Wait for the receiver goroutine to finish
-	shutdownWg.Wait() // Wait for the cleanup goroutine to finish
+	shutdownWg.Wait()    // Wait for the cleanup goroutine to finish
 	log.Println("Cleanup complete.")
 }
 
@@ -808,10 +826,9 @@ type synPacker struct {
 	ipChecksumOffset  int
 	tcpChecksumOffset int
 	pseudoHeader      []byte
-	useHwChecksum     bool
 }
 
-func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int, useHwChecksum bool) (*synPacker, error) {
+func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*synPacker, error) {
 	eth := &layers.Ethernet{
 		SrcMAC:       srcMAC,
 		DstMAC:       dstMAC,
@@ -869,7 +886,6 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int, us
 		ipChecksumOffset:  ethHeaderLen + 10,               // Checksum is at byte 10 of IP header
 		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16, // Checksum is at byte 16 of TCP header
 		pseudoHeader:      pseudoHeader,
-		useHwChecksum:     useHwChecksum,
 	}
 
 	return p, nil
@@ -890,13 +906,7 @@ func (p *synPacker) pack(pktBuf []byte, dstIP net.IP, dstPort uint16, seq uint32
 	binary.BigEndian.PutUint16(pktBuf[p.ipChecksumOffset:p.ipChecksumOffset+2], 0)
 	binary.BigEndian.PutUint16(pktBuf[p.tcpChecksumOffset:p.tcpChecksumOffset+2], 0)
 
-	if p.useHwChecksum {
-		// With hardware offloading enabled, the NIC will calculate the checksums.
-		// We've zeroed them out, so our work here is done.
-		return
-	}
-
-	// Fallback to software checksum calculation
+	// Software checksum calculation
 	// Recalculate IP checksum
 	ipHeader := pktBuf[p.ethHeaderLen : p.ethHeaderLen+p.ipHeaderLen]
 	ipCsum := checksum(ipHeader)
