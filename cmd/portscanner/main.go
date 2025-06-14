@@ -27,6 +27,7 @@ import (
 	"github.com/slavc/xdp"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"container/list"
 )
 
 const (
@@ -82,8 +83,7 @@ func main() {
 	var dests []*dest
 	for _, ip := range ips {
 		for _, p := range ports {
-			key := fmt.Sprintf("%s:%d", ip.String(), p)
-			dests = append(dests, &dest{key: key, ip: ip, port: p, status: "unknown"})
+			dests = append(dests, &dest{ip: ip, port: p, status: "unknown"})
 		}
 	}
 
@@ -135,7 +135,6 @@ func main() {
 	}
 
 	log.Printf("Found default gateway: %s", gatewayIP)
-
 
 	gatewayMAC, err := getGatewayMAC(ifaceName, srcIP, gatewayIP, verbose)
 	if err != nil {
@@ -251,10 +250,14 @@ func main() {
 	log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
 
 	// Map to quickly find dest by ip:port string
-	outstanding := make(map[string]*dest, len(dests))
+	outstanding := make(map[destKey]*dest, len(dests))
 	var outstandingMu sync.RWMutex
+	// Time-ordered list for efficient timeout handling.
+	timeoutQueue := list.New()
 	for _, d := range dests {
-		outstanding[d.key] = d
+		key := makeDestKey(d.ip, d.port)
+		d.key = key
+		outstanding[key] = d
 		d.isQueued = true // It is now in the pending queue
 	}
 
@@ -330,7 +333,16 @@ func main() {
 	nextDestIndex := 0
 	var retryDests []*dest
 	var retryNextIndex int
-	timeoutChan := make(chan *dest, BATCH_SIZE*2) // Buffered channel for destinations that timed out
+	// Buffered channel for results to decouple printing from the receiver loop.
+	resultsChan := make(chan string, 4096)
+	var printerWg sync.WaitGroup
+	printerWg.Add(1)
+	go func() {
+		defer printerWg.Done()
+		for result := range resultsChan {
+			fmt.Println(result)
+		}
+	}()
 
 	// Create the packet packer
 	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort)
@@ -338,50 +350,55 @@ func main() {
 		log.Fatalf("failed to create syn packet generator: %v", err)
 	}
 
-	// Start a separate goroutine to handle timeouts and retries. This avoids
-	// blocking the main send/receive loop with timeout processing logic.
+	// Start a separate goroutine to handle timeouts and retries.
 	var timeoutWg sync.WaitGroup
 	timeoutWg.Add(1)
 	go func() {
 		defer timeoutWg.Done()
 		for {
 			select {
-			case target, ok := <-timeoutChan:
-				if !ok {
-					return // Channel closed
-				}
-
+			case <-done:
+				return
+			default:
 				outstandingMu.Lock()
-				// Re-check status in case it was processed between timeout and now
-				if target.status != "unknown" {
+				// Check the front of the queue without removing.
+				front := timeoutQueue.Front()
+				if front == nil {
+					// Queue is empty, wait for a bit.
 					outstandingMu.Unlock()
+					time.Sleep(10 * time.Millisecond)
 					continue
 				}
 
+				target := front.Value.(*dest)
+				if time.Since(target.lastSent) < retryTimeout {
+					// Head of the queue hasn't timed out, so nothing else has either.
+					outstandingMu.Unlock()
+					// Sleep until the head is expected to time out.
+					sleepTime := retryTimeout - time.Since(target.lastSent)
+					time.Sleep(sleepTime)
+					continue
+				}
+
+				// The head has timed out. Process it and any others that have also timed out.
+				timeoutQueue.Remove(front)
 				if target.retries >= maxRetries {
 					if verbose {
-						log.Printf("Filtered: %s", target.key)
+						resultsChan <- fmt.Sprintf("[DEBUG] Filtered: %s:%d", target.ip, target.port)
 					}
 					target.status = "filtered"
 					delete(outstanding, target.key)
 					atomic.AddUint64(&completedCount, 1)
 				} else {
 					if !target.isQueued {
-						// Add to the queue for re-transmission
 						retryDests = append(retryDests, target)
 						target.isQueued = true
 					}
 				}
 				outstandingMu.Unlock()
-			case <-done:
-				return
 			}
 		}
 	}()
-
-	// Use a periodic timer for timeout checks to reduce overhead.
-	timeoutCheckInterval := 100 * time.Millisecond
-	nextTimeoutCheck := time.Now().Add(timeoutCheckInterval)
 
 	var seq uint32
 	// Decouple receiver logic into its own goroutine to allow the sender to
@@ -422,20 +439,25 @@ func main() {
 				for _, d := range rxDescs {
 					frame := xsk.GetFrame(d)
 					if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
-						key := fmt.Sprintf("%s:%d", ip.String(), port)
+						key := makeDestKey(ip, port)
 						outstandingMu.Lock()
 						if target, ok := outstanding[key]; ok {
 							if target.status == "unknown" { // Avoid race with timeout
 								target.status = status
 								delete(outstanding, key)
+								// Remove from timeout queue to prevent it from being marked as filtered.
+								if target.timeoutElem != nil {
+									timeoutQueue.Remove(target.timeoutElem)
+								}
+
 								atomic.AddUint64(&completedCount, 1)
 								if status == "open" {
 									atomic.AddUint64(&openCount, 1)
-									fmt.Printf("OPEN: %s\n", key)
+									resultsChan <- fmt.Sprintf("OPEN: %s:%d", target.ip, target.port)
 								} else if status == "closed" {
 									atomic.AddUint64(&closedCount, 1)
 									if showClosed {
-										fmt.Printf("CLOSED: %s\n", key)
+										resultsChan <- fmt.Sprintf("CLOSED: %s:%d", target.ip, target.port)
 									}
 								}
 								processedPackets++
@@ -461,7 +483,10 @@ func main() {
 		}
 	}()
 
-	for len(outstanding) > 0 {
+	outstandingMu.RLock()
+	outstandingCount := len(outstanding)
+	outstandingMu.RUnlock()
+	for outstandingCount > 0 {
 		// Always check for completions first, even if we can't send packets
 		_, completed, err := xsk.Poll(0) // Use non-blocking poll for completions
 		if err != nil && err != unix.EAGAIN {
@@ -515,6 +540,9 @@ func main() {
 					descs[i].Len = uint32(pktLen)
 
 					target.lastSent = time.Now()
+					outstandingMu.Lock()
+					target.timeoutElem = timeoutQueue.PushBack(target)
+					outstandingMu.Unlock()
 					target.retries++
 					packetsToSend++
 				}
@@ -541,39 +569,15 @@ func main() {
 			}
 		}
 
-		// 2. Handle timeouts and retries periodically instead of on every loop.
-		now := time.Now()
-		if now.After(nextTimeoutCheck) {
-			var timeoutStart time.Time
-			if verbose {
-				timeoutStart = time.Now()
-			}
-			outstandingMu.RLock()
-			for _, target := range outstanding {
-				if target.status != "unknown" {
-					continue // Already handled
-				}
-				if target.lastSent.IsZero() {
-					continue
-				}
-
-				if now.Sub(target.lastSent) > retryTimeout {
-					// Offload timeout handling to the dedicated goroutine
-					// to avoid blocking the main loop.
-					select {
-					case timeoutChan <- target:
-					default:
-						// If the channel is full, we'll just try again on the next tick.
-						// This is a rare case but prevents blocking.
-					}
-				}
-			}
-			outstandingMu.RUnlock()
-			if verbose {
-				log.Printf("[BENCH] Timeout check took %s", time.Since(timeoutStart))
-			}
-			nextTimeoutCheck = now.Add(timeoutCheckInterval)
+		// Let the sender loop yield to the OS scheduler briefly if it's running too hot
+		// and not finding free slots. This can prevent live-locking on the CPU.
+		if numFree == 0 {
+			runtime.Gosched()
 		}
+
+		outstandingMu.RLock()
+		outstandingCount = len(outstanding)
+		outstandingMu.RUnlock()
 	}
 	runtime.UnlockOSThread()
 
@@ -584,93 +588,34 @@ func main() {
 	closeOnce.Do(func() {
 		xsk.Close()
 	})
-	close(timeoutChan) // Close the timeout channel to signal the goroutine to exit
 	// Wait for the stats goroutine to finish to avoid data races on log/stdout.
 	wg.Wait()
-	timeoutWg.Wait()     // Wait for the timeout goroutine to finish
+	timeoutWg.Wait() // Wait for the timeout goroutine to finish
 	receiverWg.Wait()    // Wait for the receiver goroutine to finish
-	shutdownWg.Wait()    // Wait for the cleanup goroutine to finish
+	close(resultsChan)
+	printerWg.Wait()
+	shutdownWg.Wait() // Wait for the cleanup goroutine to finish
 	log.Println("Cleanup complete.")
 }
 
-func parseIPsAndCIDRs(s string) ([]net.IP, error) {
-	var ips []net.IP
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if strings.Contains(part, "/") {
-			// CIDR
-			_, ipnet, err := net.ParseCIDR(part)
-			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
-			}
-			if ipnet.IP.To4() == nil {
-				return nil, fmt.Errorf("only IPv4 CIDRs are supported: %q", part)
-			}
+type destKey [18]byte // 16 for IP, 2 for port
 
-			// Iterate over all IPs in the network. For subnets larger than /31,
-			// skip the network and broadcast addresses as they are not scannable.
-			maskSize, bits := ipnet.Mask.Size()
-			isRegularSubnet := bits == 32 && maskSize < 31
-
-			startIP := ipnet.IP.Mask(ipnet.Mask)
-			if isRegularSubnet {
-				inc(startIP) // Skip network address
-			}
-
-			for ip := startIP; ipnet.Contains(ip); inc(ip) {
-				addr := make(net.IP, len(ip))
-				copy(addr, ip)
-
-				// For regular subnets, check if we're at the broadcast address and stop.
-				if isRegularSubnet {
-					// The broadcast address is the last address in the range. If the next
-					// IP is not in the subnet, the current one is the broadcast address.
-					nextIP := make(net.IP, len(ip))
-					copy(nextIP, ip)
-					inc(nextIP)
-					if !ipnet.Contains(nextIP) {
-						break // Don't include broadcast address
-					}
-				}
-				ips = append(ips, addr.To4())
-			}
-		} else {
-			// Single IP
-			ip := net.ParseIP(part)
-			if ip == nil {
-				return nil, fmt.Errorf("invalid IP address: %q", part)
-			}
-			ip = ip.To4()
-			if ip == nil {
-				return nil, fmt.Errorf("only IPv4 addresses are supported: %q", part)
-			}
-			ips = append(ips, ip)
-		}
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no valid IPs or CIDRs found")
-	}
-	return ips, nil
-}
-
-// inc increments an IP address. It is used to iterate over a CIDR range.
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
+func makeDestKey(ip net.IP, port uint16) destKey {
+	var key destKey
+	copy(key[:16], ip.To16())
+	binary.BigEndian.PutUint16(key[16:], port)
+	return key
 }
 
 type dest struct {
-	key      string
-	ip       net.IP
-	port     uint16
-	status   string // unknown, open, closed, filtered
-	retries  int
-	lastSent time.Time
-	isQueued bool
+	key         destKey
+	ip          net.IP
+	port        uint16
+	status      string // unknown, open, closed, filtered
+	retries     int
+	lastSent    time.Time
+	isQueued    bool
+	timeoutElem *list.Element
 }
 
 func parsePorts(s string) ([]uint16, error) {
