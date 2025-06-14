@@ -3,11 +3,20 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/in.h>
+#include <bpf/bpf_endian.h>
 
 // IMPORTANT: This is the hardcoded source port for filtering.
 // If you change the -srcport flag in the Go program, you MUST
 // change this value to match and recompile this eBPF program.
 #define FILTER_PORT 54321
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, 1); // Only using queue 0
+} qidconf_map SEC(".maps");
 
 /*
  * This is the XSK map, which is used to redirect packets to a userspace
@@ -34,7 +43,7 @@ int xdp_port_filter(struct xdp_md *ctx) {
 	}
 
 	// We only care about IPv4 packets
-	if (eth->h_proto != __bpf_htons(ETH_P_IP)) {
+	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 		return XDP_PASS;
 	}
 
@@ -54,7 +63,7 @@ int xdp_port_filter(struct xdp_md *ctx) {
 	}
 
 	// Filter for packets destined to our source port
-	if (tcp->dest == __bpf_htons(FILTER_PORT)) {
+	if (tcp->dest == bpf_htons(FILTER_PORT)) {
 		return bpf_redirect_map(&xsks_map, 0, 0);
 	}
 

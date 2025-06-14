@@ -11,5 +11,6 @@ require (
 
 require (
 	github.com/cilium/ebpf v0.9.1 // indirect
+	github.com/j-keck/arping v1.0.3 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 )
