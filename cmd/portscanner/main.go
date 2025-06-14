@@ -520,6 +520,11 @@ func main() {
 				}
 
 				if packetsToSend > 0 {
+					if verbose {
+						duration := time.Since(packBatchStart)
+						atomic.AddUint64(&totalPackTimeNs, uint64(duration.Nanoseconds()))
+						log.Printf("[BENCH] Packing %d packets took %s", packetsToSend, duration)
+					}
 					var transmitStart time.Time
 					if verbose {
 						transmitStart = time.Now()
