@@ -221,9 +221,6 @@ func main() {
 		}
 	}
 
-	var shutdownWg sync.WaitGroup
-	shutdownWg.Add(1)
-
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
@@ -232,12 +229,6 @@ func main() {
 			close(done)
 		case <-done:
 		}
-	}()
-
-	go func() {
-		defer shutdownWg.Done()
-		<-done
-		cleanup()
 	}()
 
 	if err := prog.Register(0, xsk.FD()); err != nil {
@@ -578,8 +569,8 @@ func main() {
 	close(resultsChan)
 	printerWg.Wait()
 
-	// Finally, wait for the shutdown/cleanup goroutine.
-	shutdownWg.Wait()
+	// All goroutines have finished; now it is safe to clean up the socket and detach the XDP program.
+	cleanup()
 	log.Println("Cleanup complete.")
 }
 
