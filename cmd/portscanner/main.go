@@ -598,6 +598,76 @@ func main() {
 	log.Println("Cleanup complete.")
 }
 
+func parseIPsAndCIDRs(s string) ([]net.IP, error) {
+	var ips []net.IP
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, "/") {
+			// CIDR
+			_, ipnet, err := net.ParseCIDR(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
+			}
+			if ipnet.IP.To4() == nil {
+				return nil, fmt.Errorf("only IPv4 CIDRs are supported: %q", part)
+			}
+
+			// Iterate over all IPs in the network. For subnets larger than /31,
+			// skip the network and broadcast addresses as they are not scannable.
+			maskSize, bits := ipnet.Mask.Size()
+			isRegularSubnet := bits == 32 && maskSize < 31
+
+			startIP := ipnet.IP.Mask(ipnet.Mask)
+			if isRegularSubnet {
+				inc(startIP) // Skip network address
+			}
+
+			for ip := startIP; ipnet.Contains(ip); inc(ip) {
+				addr := make(net.IP, len(ip))
+				copy(addr, ip)
+
+				// For regular subnets, check if we're at the broadcast address and stop.
+				if isRegularSubnet {
+					// The broadcast address is the last address in the range. If the next
+					// IP is not in the subnet, the current one is the broadcast address.
+					nextIP := make(net.IP, len(ip))
+					copy(nextIP, ip)
+					inc(nextIP)
+					if !ipnet.Contains(nextIP) {
+						break // Don't include broadcast address
+					}
+				}
+				ips = append(ips, addr.To4())
+			}
+		} else {
+			// Single IP
+			ip := net.ParseIP(part)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid IP address: %q", part)
+			}
+			ip = ip.To4()
+			if ip == nil {
+				return nil, fmt.Errorf("only IPv4 addresses are supported: %q", part)
+			}
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no valid IPs or CIDRs found")
+	}
+	return ips, nil
+}
+
+// inc increments an IP address. It is used to iterate over a CIDR range.
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
 type destKey [18]byte // 16 for IP, 2 for port
 
 func makeDestKey(ip net.IP, port uint16) destKey {
