@@ -34,7 +34,7 @@ const (
 	// This is a trade-off between syscall overhead and packet send latency.
 	// A larger batch size will result in higher throughput, but also higher
 	// latency.
-	BATCH_SIZE = 512
+	BATCH_SIZE = 4096
 )
 
 func main() {
@@ -47,6 +47,7 @@ func main() {
 		retryTimeout time.Duration
 		maxRetries   int
 		showClosed   bool
+		ringSize     int
 	)
 
 	flag.StringVar(&ifaceName, "iface", "", "Network interface to use (mandatory)")
@@ -57,6 +58,7 @@ func main() {
 	flag.DurationVar(&retryTimeout, "retry-timeout", 1*time.Second, "Time to wait for a response before retrying a port")
 	flag.IntVar(&maxRetries, "retries", 3, "Number of retries for each port before marking as filtered")
 	flag.BoolVar(&showClosed, "show-closed", false, "Show closed ports in output")
+	flag.IntVar(&ringSize, "ring-size", 4096, "AF_XDP ring size (descs). Increase for higher throughput. Requires more locked memory.")
 	flag.Parse()
 
 	if ifaceName == "" || ipsArg == "" || portsArg == "" {
@@ -80,7 +82,8 @@ func main() {
 	var dests []*dest
 	for _, ip := range ips {
 		for _, p := range ports {
-			dests = append(dests, &dest{ip: ip, port: p, status: "unknown"})
+			key := fmt.Sprintf("%s:%d", ip.String(), p)
+			dests = append(dests, &dest{key: key, ip: ip, port: p, status: "unknown"})
 		}
 	}
 
@@ -133,6 +136,10 @@ func main() {
 
 	log.Printf("Found default gateway: %s", gatewayIP)
 
+	// Check for and enable hardware checksum offloading for performance.
+	// Fall back to software checksums if it's not available.
+	useHwChecksum := checkAndEnableChecksumOffloading(ifaceName, verbose)
+
 	gatewayMAC, err := getGatewayMAC(ifaceName, srcIP, gatewayIP, verbose)
 	if err != nil {
 		log.Fatalf("Could not resolve gateway MAC: %v. Please ensure you are running with sufficient privileges and you can ping the gateway.", err)
@@ -162,12 +169,12 @@ func main() {
 	// With large numbers of ports, we need larger rings. Note that this
 	// may require raising the locked memory limit on your system (ulimit -l).
 	socketOptions := xdp.SocketOptions{
-		NumFrames:              8192,
+		NumFrames:              ringSize * 2,
 		FrameSize:              4096,
-		FillRingNumDescs:       4096,
-		CompletionRingNumDescs: 4096,
-		RxRingNumDescs:         4096,
-		TxRingNumDescs:         4096,
+		FillRingNumDescs:       ringSize,
+		CompletionRingNumDescs: ringSize,
+		RxRingNumDescs:         ringSize,
+		TxRingNumDescs:         ringSize,
 	}
 
 	xsk, err := xdp.NewSocket(iface.Attrs().Index, 0, &socketOptions)
@@ -240,9 +247,9 @@ func main() {
 
 	// Map to quickly find dest by ip:port string
 	outstanding := make(map[string]*dest, len(dests))
+	var outstandingMu sync.RWMutex
 	for _, d := range dests {
-		key := fmt.Sprintf("%s:%d", d.ip.String(), d.port)
-		outstanding[key] = d
+		outstanding[d.key] = d
 		d.isQueued = true // It is now in the pending queue
 	}
 
@@ -300,26 +307,118 @@ func main() {
 	nextDestIndex := 0
 	var retryDests []*dest
 	var retryNextIndex int
+	timeoutChan := make(chan *dest, BATCH_SIZE*2) // Buffered channel for destinations that timed out
 
 	// Create the packet packer
-	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort)
+	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort, useHwChecksum)
 	if err != nil {
 		log.Fatalf("failed to create syn packet generator: %v", err)
 	}
+
+	// Start a separate goroutine to handle timeouts and retries. This avoids
+	// blocking the main send/receive loop with timeout processing logic.
+	var timeoutWg sync.WaitGroup
+	timeoutWg.Add(1)
+	go func() {
+		defer timeoutWg.Done()
+		for {
+			select {
+			case target, ok := <-timeoutChan:
+				if !ok {
+					return // Channel closed
+				}
+
+				outstandingMu.Lock()
+				// Re-check status in case it was processed between timeout and now
+				if target.status != "unknown" {
+					outstandingMu.Unlock()
+					continue
+				}
+
+				if target.retries >= maxRetries {
+					if verbose {
+						log.Printf("Filtered: %s", target.key)
+					}
+					target.status = "filtered"
+					delete(outstanding, target.key)
+					atomic.AddUint64(&completedCount, 1)
+				} else {
+					if !target.isQueued {
+						// Add to the queue for re-transmission
+						retryDests = append(retryDests, target)
+						target.isQueued = true
+					}
+				}
+				outstandingMu.Unlock()
+			case <-done:
+				return
+			}
+		}
+	}()
 
 	// Use a periodic timer for timeout checks to reduce overhead.
 	timeoutCheckInterval := 100 * time.Millisecond
 	nextTimeoutCheck := time.Now().Add(timeoutCheckInterval)
 
-	frameMem := make([][]byte, socketOptions.TxRingNumDescs)
-	for i := range frameMem {
-		frameMem[i] = make([]byte, len(packer.template))
-	}
-
 	var seq uint32
+	// Decouple receiver logic into its own goroutine to allow the sender to
+	// run at full speed without being blocked by receive logic.
+	var receiverWg sync.WaitGroup
+	receiverWg.Add(1)
+	go func() {
+		defer receiverWg.Done()
+		runtime.LockOSThread() // Dedicate a core to receiving
+
+		for {
+			// A blocking poll is used here to wait efficiently for incoming packets.
+			// This goroutine's only job is to receive, so blocking is ideal.
+			numRx, _, err := xsk.Poll(-1)
+			if err != nil {
+				if err == unix.EINTR || err == unix.EBADF {
+					break // Socket closed, exit
+				}
+				log.Printf("Receiver poll error: %v", err)
+				continue
+			}
+
+			if numRx > 0 {
+				rxDescs := xsk.Receive(numRx)
+				atomic.AddUint64(&totalRx, uint64(len(rxDescs)))
+				for _, d := range rxDescs {
+					frame := xsk.GetFrame(d)
+					if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
+						key := fmt.Sprintf("%s:%d", ip.String(), port)
+						outstandingMu.Lock()
+						if target, ok := outstanding[key]; ok {
+							if target.status == "unknown" { // Avoid race with timeout
+								target.status = status
+								delete(outstanding, key)
+								atomic.AddUint64(&completedCount, 1)
+								if status == "open" {
+									atomic.AddUint64(&openCount, 1)
+									fmt.Printf("OPEN: %s\n", key)
+								} else if status == "closed" {
+									atomic.AddUint64(&closedCount, 1)
+									if showClosed {
+										fmt.Printf("CLOSED: %s\n", key)
+									}
+								}
+							}
+						}
+						outstandingMu.Unlock()
+					}
+				}
+				xsk.Fill(rxDescs)
+			}
+			if len(outstanding) == 0 {
+				break
+			}
+		}
+	}()
+
 	for len(outstanding) > 0 {
 		// Always check for completions first, even if we can't send packets
-		numRx, completed, err := xsk.Poll(0) // Use non-blocking poll
+		_, completed, err := xsk.Poll(0) // Use non-blocking poll for completions
 		if err != nil && err != unix.EAGAIN {
 			log.Printf("Poll error: %v", err)
 		}
@@ -336,6 +435,7 @@ func main() {
 				for i := range descs {
 					var target *dest
 					// Prioritize retries
+					outstandingMu.Lock()
 					if retryNextIndex < len(retryDests) {
 						target = retryDests[retryNextIndex]
 						retryNextIndex++
@@ -349,20 +449,21 @@ func main() {
 							retryDests = retryDests[:0]
 							retryNextIndex = 0
 						}
+						outstandingMu.Unlock()
 						break
 					}
+					outstandingMu.Unlock()
 
 					target.isQueued = false
 
-					// Use one of the pre-allocated buffers
-					buf := frameMem[i]
-					seq += 0x01000193 // FNV prime, any odd increment works
-					packer.pack(buf, target.ip, target.port, seq)
-
-					// Copy the crafted packet into the XDP frame for transmission
+					// Get the XDP frame and pack the packet directly into it, avoiding a copy.
 					frame := xsk.GetFrame(descs[i])
-					copy(frame, buf)
-					descs[i].Len = uint32(len(buf))
+					pktLen := len(packer.template)
+					packer.pack(frame[:pktLen], target.ip, target.port, seq)
+					seq += 0x01000193 // FNV prime, any odd increment works
+
+					// Set the frame length for transmission
+					descs[i].Len = uint32(pktLen)
 
 					target.lastSent = time.Now()
 					target.retries++
@@ -379,62 +480,30 @@ func main() {
 			}
 		}
 
-		// 2. Receive packets
-		if numRx > 0 {
-			rxDescs := xsk.Receive(numRx)
-			atomic.AddUint64(&totalRx, uint64(len(rxDescs)))
-			for _, d := range rxDescs {
-				frame := xsk.GetFrame(d)
-				if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
-					key := fmt.Sprintf("%s:%d", ip.String(), port)
-					if target, ok := outstanding[key]; ok {
-						target.status = status
-						delete(outstanding, key)
-						atomic.AddUint64(&completedCount, 1)
-						if status == "open" {
-							atomic.AddUint64(&openCount, 1)
-							fmt.Printf("OPEN: %s\n", key)
-						} else if status == "closed" {
-							atomic.AddUint64(&closedCount, 1)
-							if showClosed {
-								fmt.Printf("CLOSED: %s\n", key)
-							}
-						}
-					}
-				}
-			}
-			xsk.Fill(rxDescs)
-		}
-
-		// 3. Handle timeouts and retries periodically instead of on every loop.
+		// 2. Handle timeouts and retries periodically instead of on every loop.
 		now := time.Now()
 		if now.After(nextTimeoutCheck) {
-			for key, target := range outstanding {
+			outstandingMu.RLock()
+			for _, target := range outstanding {
 				if target.status != "unknown" {
 					continue // Already handled
 				}
-				// Don't check timeout for something that was never sent
 				if target.lastSent.IsZero() {
 					continue
 				}
 
 				if now.Sub(target.lastSent) > retryTimeout {
-					if target.retries >= maxRetries {
-						if verbose {
-							log.Printf("Filtered: %s", key)
-						}
-						target.status = "filtered"
-						delete(outstanding, key)
-						atomic.AddUint64(&completedCount, 1)
-					} else {
-						if !target.isQueued {
-							// Add to the queue for re-transmission
-							retryDests = append(retryDests, target)
-							target.isQueued = true
-						}
+					// Offload timeout handling to the dedicated goroutine
+					// to avoid blocking the main loop.
+					select {
+					case timeoutChan <- target:
+					default:
+						// If the channel is full, we'll just try again on the next tick.
+						// This is a rare case but prevents blocking.
 					}
 				}
 			}
+			outstandingMu.RUnlock()
 			nextTimeoutCheck = now.Add(timeoutCheckInterval)
 		}
 	}
@@ -442,10 +511,15 @@ func main() {
 
 	log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.", atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
 	close(done)
+	// The receiver goroutine uses a blocking poll, so we need to close the socket
+	// here to unblock it and allow it to exit gracefully.
+	xsk.Close()
+	close(timeoutChan) // Close the timeout channel to signal the goroutine to exit
 	// Wait for the stats goroutine to finish to avoid data races on log/stdout.
 	wg.Wait()
-	// Wait for the cleanup goroutine to finish before exiting main.
-	shutdownWg.Wait()
+	timeoutWg.Wait()     // Wait for the timeout goroutine to finish
+	receiverWg.Wait()    // Wait for the receiver goroutine to finish
+	shutdownWg.Wait() // Wait for the cleanup goroutine to finish
 	log.Println("Cleanup complete.")
 }
 
@@ -520,6 +594,7 @@ func inc(ip net.IP) {
 }
 
 type dest struct {
+	key      string
 	ip       net.IP
 	port     uint16
 	status   string // unknown, open, closed, filtered
@@ -733,9 +808,10 @@ type synPacker struct {
 	ipChecksumOffset  int
 	tcpChecksumOffset int
 	pseudoHeader      []byte
+	useHwChecksum     bool
 }
 
-func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*synPacker, error) {
+func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int, useHwChecksum bool) (*synPacker, error) {
 	eth := &layers.Ethernet{
 		SrcMAC:       srcMAC,
 		DstMAC:       dstMAC,
@@ -793,6 +869,7 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*
 		ipChecksumOffset:  ethHeaderLen + 10,               // Checksum is at byte 10 of IP header
 		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16, // Checksum is at byte 16 of TCP header
 		pseudoHeader:      pseudoHeader,
+		useHwChecksum:     useHwChecksum,
 	}
 
 	return p, nil
@@ -809,12 +886,17 @@ func (p *synPacker) pack(pktBuf []byte, dstIP net.IP, dstPort uint16, seq uint32
 	binary.BigEndian.PutUint16(pktBuf[p.tcpDstPortOffset:p.tcpDstPortOffset+2], dstPort)
 	binary.BigEndian.PutUint32(pktBuf[p.tcpSeqOffset:p.tcpSeqOffset+4], seq)
 
-	// Zero out checksums for hardware offloading.
+	// Zero out checksums for recalculation.
 	binary.BigEndian.PutUint16(pktBuf[p.ipChecksumOffset:p.ipChecksumOffset+2], 0)
 	binary.BigEndian.PutUint16(pktBuf[p.tcpChecksumOffset:p.tcpChecksumOffset+2], 0)
 
-	// Software checksum calculation is now enabled to ensure correctness,
-	// as hardware offload can be unreliable.
+	if p.useHwChecksum {
+		// With hardware offloading enabled, the NIC will calculate the checksums.
+		// We've zeroed them out, so our work here is done.
+		return
+	}
+
+	// Fallback to software checksum calculation
 	// Recalculate IP checksum
 	ipHeader := pktBuf[p.ethHeaderLen : p.ethHeaderLen+p.ipHeaderLen]
 	ipCsum := checksum(ipHeader)
@@ -883,4 +965,56 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func checkAndEnableChecksumOffloading(ifaceName string, verbose bool) bool {
+	ethtoolPath, err := exec.LookPath("ethtool")
+	if err != nil {
+		log.Println("Warning: 'ethtool' not found. Cannot verify or enable checksum offloading.")
+		log.Println("Falling back to software checksums, which may impact performance.")
+		return false
+	}
+
+	// isOffloadEnabled checks the current state of TX checksumming.
+	isOffloadEnabled := func() bool {
+		cmd := exec.Command(ethtoolPath, "-k", ifaceName)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			if verbose {
+				log.Printf("Could not check offloading features with 'ethtool -k': %v", err)
+			}
+			return false // Assume disabled if we can't check
+		}
+		// Modern ethtool uses 'tx-checksum-ip-generic', older might show 'tx-checksumming'.
+		// We look for either being 'on'.
+		output := string(out)
+		return strings.Contains(output, "tx-checksum-ip-generic: on") || strings.Contains(output, "tx-checksumming: on")
+	}
+
+	if isOffloadEnabled() {
+		log.Println("Hardware TX checksum offloading is already enabled.")
+		return true
+	}
+
+	log.Println("Attempting to enable hardware TX checksum offloading for performance...")
+	// Using 'tx on' is a general way to enable TCP/UDP/SCTP checksum offload on transmit.
+	cmd := exec.Command(ethtoolPath, "-K", ifaceName, "tx", "on")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: Failed to enable TX checksum offloading with 'ethtool -K %s tx on'. Error: %v", ifaceName, err)
+		if len(out) > 0 {
+			log.Printf("Output: %s", string(out))
+		}
+		log.Println("Falling back to software checksums, which may impact performance.")
+		return false
+	}
+
+	// Verify that it was enabled
+	if isOffloadEnabled() {
+		log.Println("Successfully enabled hardware TX checksum offloading.")
+		return true
+	}
+
+	log.Println("Warning: Attempted to enable hardware TX checksum offloading, but it's still disabled.")
+	log.Println("Falling back to software checksums, which may impact performance.")
+	return false
 }
