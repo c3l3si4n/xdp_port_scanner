@@ -259,12 +259,12 @@ func main() {
 	}
 
 	// Stats tracking
-	var totalTx, totalRx, completedCount, openCount, closedCount, rawPacketCount uint64
+	var totalTx, totalRx, completedCount, openCount, closedCount, rawPacketCount, totalPackTimeNs, totalProcessTimeNs uint64
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var lastTx, lastRx, lastCompleted uint64
+		var lastTx, lastRx, lastCompleted, lastPackTimeNs, lastProcessTimeNs uint64
 		lastTime := time.Now()
 		ticker := time.NewTicker(2 * time.Second) // Report every 2s for less noise
 		defer ticker.Stop()
@@ -281,6 +281,8 @@ func main() {
 				currentTx := atomic.LoadUint64(&totalTx)
 				currentRx := atomic.LoadUint64(&totalRx)
 				rawRx := atomic.LoadUint64(&rawPacketCount)
+				currentPackTimeNs := atomic.LoadUint64(&totalPackTimeNs)
+				currentProcessTimeNs := atomic.LoadUint64(&totalProcessTimeNs)
 				currentCompleted := atomic.LoadUint64(&completedCount)
 				currentOpen := atomic.LoadUint64(&openCount)
 				currentClosed := atomic.LoadUint64(&closedCount)
@@ -289,11 +291,26 @@ func main() {
 				rxPps := float64(currentRx-lastRx) / elapsed.Seconds()
 				scansPerSec := float64(currentCompleted-lastCompleted) / elapsed.Seconds()
 
-				log.Printf("Stats: TX %.0f pps, RX %.0f pps (Raw: %d), Scans %.0f/s | Outstanding: %d | Open: %d, Closed: %d",
-					txPps, rxPps, rawRx, scansPerSec, len(outstanding), currentOpen, currentClosed)
+				var avgPackTime float64
+				if (currentTx - lastTx) > 0 {
+					avgPackTime = float64(currentPackTimeNs-lastPackTimeNs) / float64(currentTx-lastTx)
+				}
+				var avgProcessTime float64
+				if (currentRx - lastRx) > 0 {
+					avgProcessTime = float64(currentProcessTimeNs-lastProcessTimeNs) / float64(currentRx-lastRx)
+				}
+
+				outstandingMu.RLock()
+				outstandingCount := len(outstanding)
+				outstandingMu.RUnlock()
+
+				log.Printf("Stats: TX %.0f pps, RX %.0f pps (Raw: %d), Scans %.0f/s | Avg Pack: %.0f ns, Avg Process: %.0f ns | Outstanding: %d | Open: %d, Closed: %d",
+					txPps, rxPps, rawRx, scansPerSec, avgPackTime, avgProcessTime, outstandingCount, currentOpen, currentClosed)
 
 				lastTx = currentTx
 				lastRx = currentRx
+				lastPackTimeNs = currentPackTimeNs
+				lastProcessTimeNs = currentProcessTimeNs
 				lastCompleted = currentCompleted
 				lastTime = now
 			case <-done:
@@ -378,7 +395,14 @@ func main() {
 		for {
 			// A blocking poll is used here to wait efficiently for incoming packets.
 			// This goroutine's only job is to receive, so blocking is ideal.
+			var pollStart time.Time
+			if verbose {
+				pollStart = time.Now()
+			}
 			numRx, _, err := xsk.Poll(-1)
+			if verbose {
+				log.Printf("[BENCH] Poll wait took %s", time.Since(pollStart))
+			}
 			if err != nil {
 				if err == unix.EINTR || err == unix.EBADF {
 					break // Socket closed, exit
@@ -391,6 +415,10 @@ func main() {
 				atomic.AddUint64(&rawPacketCount, uint64(numRx))
 				rxDescs := xsk.Receive(numRx)
 				processedPackets := 0
+				var processBatchStart time.Time
+				if verbose {
+					processBatchStart = time.Now()
+				}
 				for _, d := range rxDescs {
 					frame := xsk.GetFrame(d)
 					if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
@@ -415,6 +443,11 @@ func main() {
 						}
 						outstandingMu.Unlock()
 					}
+				}
+				if verbose && processedPackets > 0 {
+					duration := time.Since(processBatchStart)
+					atomic.AddUint64(&totalProcessTimeNs, uint64(duration.Nanoseconds()))
+					log.Printf("[BENCH] Processing %d packets took %s", processedPackets, duration)
 				}
 				atomic.AddUint64(&totalRx, uint64(processedPackets))
 				xsk.Fill(rxDescs)
@@ -444,6 +477,10 @@ func main() {
 			descs := xsk.GetDescs(min(numFree, BATCH_SIZE), false)
 			if len(descs) > 0 {
 				packetsToSend := 0
+				var packBatchStart time.Time
+				if verbose {
+					packBatchStart = time.Now()
+				}
 				for i := range descs {
 					var target *dest
 					// Prioritize retries
@@ -483,7 +520,14 @@ func main() {
 				}
 
 				if packetsToSend > 0 {
+					var transmitStart time.Time
+					if verbose {
+						transmitStart = time.Now()
+					}
 					xsk.Transmit(descs[:packetsToSend])
+					if verbose {
+						log.Printf("[BENCH] Transmit %d packets took %s", packetsToSend, time.Since(transmitStart))
+					}
 					// The non-blocking poll at the top of the loop is enough to kick the
 					// kernel to start processing packets. A blocking poll here would
 					// stall the send loop and starve the completion ring.
@@ -495,6 +539,10 @@ func main() {
 		// 2. Handle timeouts and retries periodically instead of on every loop.
 		now := time.Now()
 		if now.After(nextTimeoutCheck) {
+			var timeoutStart time.Time
+			if verbose {
+				timeoutStart = time.Now()
+			}
 			outstandingMu.RLock()
 			for _, target := range outstanding {
 				if target.status != "unknown" {
@@ -516,6 +564,9 @@ func main() {
 				}
 			}
 			outstandingMu.RUnlock()
+			if verbose {
+				log.Printf("[BENCH] Timeout check took %s", time.Since(timeoutStart))
+			}
 			nextTimeoutCheck = now.Add(timeoutCheckInterval)
 		}
 	}
