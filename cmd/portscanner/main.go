@@ -373,7 +373,8 @@ func main() {
 					continue
 				}
 
-				target := front.Value.(*dest)
+				var target *dest
+				target = front.Value.(*dest)
 				if time.Since(target.lastSent) < retryTimeout {
 					// Head of the queue hasn't timed out, so nothing else has either.
 					outstandingMu.Unlock()
@@ -499,8 +500,6 @@ func main() {
 			if len(descs) > 0 {
 				packetsToSend := 0
 				for i := range descs {
-					var target *dest
-					// Prioritize retries
 					outstandingMu.Lock()
 					if retryNextIndex < len(retryDests) {
 						target = retryDests[retryNextIndex]
@@ -518,9 +517,16 @@ func main() {
 						outstandingMu.Unlock()
 						break
 					}
-					outstandingMu.Unlock()
 
+					// Mark the destination as no longer queued for retry
 					target.isQueued = false
+
+					// Update timing and retry metadata under the same lock to avoid races with the timeout goroutine.
+					target.lastSent = time.Now()
+					target.retries++
+					// Enqueue the destination in the timeout list and keep the returned element for later removal.
+					target.timeoutElem = timeoutQueue.PushBack(target)
+					outstandingMu.Unlock()
 
 					// Get the XDP frame and pack the packet directly into it, avoiding a copy.
 					frame := xsk.GetFrame(descs[i])
@@ -530,12 +536,6 @@ func main() {
 
 					// Set the frame length for transmission
 					descs[i].Len = uint32(pktLen)
-
-					target.lastSent = time.Now()
-					outstandingMu.Lock()
-					target.timeoutElem = timeoutQueue.PushBack(target)
-					outstandingMu.Unlock()
-					target.retries++
 					packetsToSend++
 				}
 
