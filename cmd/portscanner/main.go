@@ -150,8 +150,13 @@ func main() {
 	done := make(chan struct{})
 	var closeOnce sync.Once
 
-	// Set SKB mode
-	xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
+	// Prefer driver (DRV) mode for highest performance. If that is not supported
+	// on the current NIC or kernel, gracefully fall back to SKB (generic) mode so
+	// the scanner still works – just at reduced performance.
+	if verbose {
+		log.Println("Attempting to attach XDP program in DRV mode for maximum performance.")
+	}
+	xdp.DefaultXdpFlags = unix.XDP_FLAGS_DRV_MODE
 
 	// Load the eBPF program from the object file.
 	// Note: The file path is relative to the running binary.
@@ -167,8 +172,18 @@ func main() {
 	log.Printf("!! Check FILTER_PORT in 'bpf/xdp_filter.c' and recompile if necessary.")
 	log.Println("====================================================================================")
 
+	// First try attaching with the previously-set DRV mode.
 	if err := prog.Attach(iface.Attrs().Index); err != nil {
-		log.Fatalf("Attach program: %v", err)
+		if verbose {
+			log.Printf("DRV mode failed: %v – falling back to SKB mode", err)
+		}
+		// Fall back to SKB mode for broad compatibility.
+		xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
+		if err := prog.Attach(iface.Attrs().Index); err != nil {
+			log.Fatalf("Attach program failed even in SKB mode: %v", err)
+		}
+	} else if verbose {
+		log.Println("Successfully attached XDP program in DRV mode.")
 	}
 
 	// With large numbers of ports, we need larger rings. Note that this
@@ -246,6 +261,9 @@ func main() {
 	})
 
 	log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
+
+	// Record start time for throughput calculation later.
+	startTime := time.Now()
 
 	// Map to quickly find dest by ip:port string
 	outstanding := make(map[destKey]*dest, len(dests))
@@ -543,7 +561,12 @@ func main() {
 	}
 	runtime.UnlockOSThread()
 
+	elapsed := time.Since(startTime).Seconds()
 	log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.", atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
+	if elapsed > 0 {
+		pps := float64(atomic.LoadUint64(&totalTx)) / elapsed
+		log.Printf("Average TX rate: %.0f packets/sec (elapsed %.2f s)", pps, elapsed)
+	}
 	close(done)
 
 	// Wait for all worker goroutines to finish before cleaning up.
