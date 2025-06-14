@@ -21,13 +21,14 @@ import (
 	"syscall"
 	"time"
 
+	"container/list"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/j-keck/arping"
 	"github.com/slavc/xdp"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-	"container/list"
 )
 
 const (
@@ -222,9 +223,6 @@ func main() {
 		defer shutdownWg.Done()
 		<-done
 		cleanup()
-		// Give a moment for logs to flush before exiting.
-		time.Sleep(100 * time.Millisecond)
-		os.Exit(0)
 	}()
 
 	if err := prog.Register(0, xsk.FD()); err != nil {
@@ -387,7 +385,6 @@ func main() {
 		}
 	}()
 
-	var seq uint32
 	// Decouple receiver logic into its own goroutine to allow the sender to
 	// run at full speed without being blocked by receive logic.
 	var receiverWg sync.WaitGroup
@@ -397,12 +394,20 @@ func main() {
 		runtime.LockOSThread() // Dedicate a core to receiving
 
 		for {
-			// A blocking poll is used here to wait efficiently for incoming packets.
-			// This goroutine's only job is to receive, so blocking is ideal.
-			numRx, _, err := xsk.Poll(-1)
+			select {
+			case <-done:
+				return
+			default:
+			}
+
+			// Poll with a timeout to remain responsive to the 'done' channel.
+			numRx, _, err := xsk.Poll(100) // 100ms timeout
 			if err != nil {
-				if err == unix.EINTR || err == unix.EBADF {
-					break // Socket closed, exit
+				if err == unix.EAGAIN || err == unix.EINTR {
+					continue // Expected on timeout
+				}
+				if err == unix.EBADF {
+					return // Socket closed
 				}
 				log.Printf("Receiver poll error: %v", err)
 				continue
@@ -457,6 +462,8 @@ func main() {
 	outstandingMu.RLock()
 	outstandingCount := len(outstanding)
 	outstandingMu.RUnlock()
+
+	var seq uint32
 	for outstandingCount > 0 {
 		// Always check for completions first, even if we can't send packets
 		_, completed, err := xsk.Poll(0) // Use non-blocking poll for completions
@@ -538,18 +545,18 @@ func main() {
 
 	log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.", atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
 	close(done)
-	// The receiver goroutine uses a blocking poll, so we need to close the socket
-	// here to unblock it and allow it to exit gracefully.
-	closeOnce.Do(func() {
-		xsk.Close()
-	})
-	// Wait for the stats goroutine to finish to avoid data races on log/stdout.
+
+	// Wait for all worker goroutines to finish before cleaning up.
 	wg.Wait()
-	timeoutWg.Wait() // Wait for the timeout goroutine to finish
-	receiverWg.Wait()    // Wait for the receiver goroutine to finish
+	timeoutWg.Wait()
+	receiverWg.Wait()
+
+	// Now that all goroutines are done, we can close the results channel and wait for the printer.
 	close(resultsChan)
 	printerWg.Wait()
-	shutdownWg.Wait() // Wait for the cleanup goroutine to finish
+
+	// Finally, wait for the shutdown/cleanup goroutine.
+	shutdownWg.Wait()
 	log.Println("Cleanup complete.")
 }
 
