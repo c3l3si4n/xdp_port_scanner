@@ -10,12 +10,13 @@
 // If you change the -srcport flag in the Go program, you MUST
 // change this value to match and recompile this eBPF program.
 #define FILTER_PORT 54321
+#define MAX_QUEUES 64 // Max number of queues to support
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(key_size, sizeof(__u32));
 	__uint(value_size, sizeof(__u32));
-	__uint(max_entries, 1); // Only using queue 0
+	__uint(max_entries, 4); // Only using queue 0
 } qidconf_map SEC(".maps");
 
 /*
@@ -27,7 +28,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
 	__uint(key_size, sizeof(__u32));
 	__uint(value_size, sizeof(__u32));
-	__uint(max_entries, 1); // Only using queue 0
+	__uint(max_entries, MAX_QUEUES);
 } xsks_map SEC(".maps");
 
 SEC("xdp")
@@ -62,9 +63,10 @@ int xdp_port_filter(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 
-	// Filter for packets destined to our source port
-	if (tcp->dest == bpf_htons(FILTER_PORT)) {
-		return bpf_redirect_map(&xsks_map, 0, 0);
+	__u16 dest_port = bpf_ntohs(tcp->dest);
+	if (dest_port >= FILTER_PORT && dest_port < FILTER_PORT + MAX_QUEUES) {
+		__u32 queue_id = ctx->rx_queue_index;
+		return bpf_redirect_map(&xsks_map, queue_id, 0);
 	}
 
 	// Otherwise, let the packet continue to the kernel's network stack

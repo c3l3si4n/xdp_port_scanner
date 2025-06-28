@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -15,13 +16,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"container/list"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -33,10 +33,34 @@ import (
 
 const (
 	// BATCH_SIZE is the number of packets to send in a single syscall.
-	// This is a trade-off between syscall overhead and packet send latency.
-	// A larger batch size will result in higher throughput, but also higher
-	// latency.
 	BATCH_SIZE = 4096
+)
+
+// Communication types for the decoupled architecture
+type PacketRequest struct {
+	IP   net.IP
+	Port uint16
+}
+
+type ScanResult struct {
+	IP     net.IP
+	Port   uint16
+	Status string // "open", "closed"
+}
+
+type StateRequest struct {
+	IP       net.IP
+	Port     uint16
+	Action   string // "add", "timeout_check"
+	LastSent time.Time
+	Retries  int
+}
+
+// Global channels for communication between components
+var (
+	packetRequestChan = make(chan PacketRequest, 16384)
+	resultChan        = make(chan ScanResult, 8192)
+	stateRequestChan  = make(chan StateRequest, 16384)
 )
 
 func main() {
@@ -50,6 +74,8 @@ func main() {
 		maxRetries   int
 		showClosed   bool
 		ringSize     int
+		numQueues    int
+		numWorkers   int
 	)
 
 	flag.StringVar(&ifaceName, "iface", "", "Network interface to use (mandatory)")
@@ -61,11 +87,18 @@ func main() {
 	flag.IntVar(&maxRetries, "retries", 3, "Number of retries for each port before marking as filtered")
 	flag.BoolVar(&showClosed, "show-closed", false, "Show closed ports in output")
 	flag.IntVar(&ringSize, "ring-size", 4096, "AF_XDP ring size (descs). Increase for higher throughput. Requires more locked memory.")
+	flag.IntVar(&numQueues, "num-queues", 1, "Number of NIC queues to use for parallel scanning.")
+	flag.IntVar(&numWorkers, "workers", runtime.NumCPU(), "Number of logic worker goroutines")
 	flag.Parse()
 
 	if ifaceName == "" || ipsArg == "" || portsArg == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	// Configure the network interface to use the specified number of queues.
+	if err := configureInterfaceQueues(ifaceName, numQueues, verbose); err != nil {
+		log.Fatalf("Could not configure interface queues: %v", err)
 	}
 
 	// Parse IPs
@@ -113,7 +146,6 @@ func main() {
 		log.Fatalf("no IPv4 address found on %s", ifaceName)
 	}
 
-	// Find default gateway by parsing /proc/net/route, as it's more robust.
 	defaultRoutes, err := getDefaultRoutes(verbose)
 	if err != nil {
 		log.Fatalf("could not determine default gateway: %v", err)
@@ -143,41 +175,22 @@ func main() {
 	}
 	log.Printf("Resolved gateway MAC: %s", gatewayMAC)
 
-	// Hardware checksum offloading has been disabled by user request.
-	// The scanner will now calculate checksums in software.
-
-	// done channel for graceful shutdown
-	done := make(chan struct{})
-	var closeOnce sync.Once
-
-	// Prefer driver (DRV) mode for highest performance. If that is not supported
-	// on the current NIC or kernel, gracefully fall back to SKB (generic) mode so
-	// the scanner still works – just at reduced performance.
+	// Load XDP program
 	if verbose {
 		log.Println("Attempting to attach XDP program in DRV mode for maximum performance.")
 	}
-	xdp.DefaultXdpFlags = unix.XDP_FLAGS_DRV_MODE
-
-	// Load the eBPF program from the object file.
-	// Note: The file path is relative to the running binary.
-	// We are now in cmd/portscanner, so we look in the bpf subdir.
+	xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
 	prog, err := xdp.LoadProgram("bpf/xdp_filter.o", "xdp_port_filter", "qidconf_map", "xsks_map")
 	if err != nil {
 		log.Fatalf("could not load XDP program: %v. \nHave you compiled it with `make` in `cmd/portscanner/bpf/`?", err)
 	}
 	log.Printf("Loaded XDP program from bpf/xdp_filter.o")
-	log.Println("====================================================================================")
-	log.Printf("!! IMPORTANT: The BPF program filters for incoming packets on a specific port.")
-	log.Printf("!! This port MUST match the -srcport flag (current: %d).", srcPort)
-	log.Printf("!! Check FILTER_PORT in 'bpf/xdp_filter.c' and recompile if necessary.")
-	log.Println("====================================================================================")
 
-	// First try attaching with the previously-set DRV mode.
+	// Attach program
 	if err := prog.Attach(iface.Attrs().Index); err != nil {
 		if verbose {
 			log.Printf("DRV mode failed: %v – falling back to SKB mode", err)
 		}
-		// Fall back to SKB mode for broad compatibility.
 		xdp.DefaultXdpFlags = unix.XDP_FLAGS_SKB_MODE
 		if err := prog.Attach(iface.Attrs().Index); err != nil {
 			log.Fatalf("Attach program failed even in SKB mode: %v", err)
@@ -186,97 +199,58 @@ func main() {
 		log.Println("Successfully attached XDP program in DRV mode.")
 	}
 
-	// With large numbers of ports, we need larger rings. Note that this
-	// may require raising the locked memory limit on your system (ulimit -l).
-	socketOptions := xdp.SocketOptions{
-		NumFrames:              ringSize * 2,
-		FrameSize:              4096,
-		FillRingNumDescs:       ringSize,
-		CompletionRingNumDescs: ringSize,
-		RxRingNumDescs:         ringSize,
-		TxRingNumDescs:         ringSize,
-	}
+	// Global done channel for graceful shutdown
+	done := make(chan struct{})
+	var closeDoneOnce sync.Once
 
-	xsk, err := xdp.NewSocket(iface.Attrs().Index, 0, &socketOptions)
-	if err != nil {
-		log.Fatalf("NewSocket: %v", err)
-	}
-
-	cleanup := func() {
-		log.Println("Detaching XDP program and closing resources...")
-		// Use sync.Once to ensure the socket is closed exactly once.
-		closeOnce.Do(func() {
-			xsk.Close()
-		})
-
-		// Detach the XDP program by running `ip link` commands. This is often more
-		// reliable than library calls, especially when using SKB_MODE.
-		cmd := exec.Command("ip", "link", "set", "dev", ifaceName, "xdp", "off")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: could not run '%s': %v. Output: %s", cmd.String(), err, string(out))
-		}
-		cmd = exec.Command("ip", "link", "set", "dev", ifaceName, "xdpgeneric", "off")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: could not run '%s': %v. Output: %s", cmd.String(), err, string(out))
-		}
-	}
-
+	// Setup signal handling
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
-		select {
-		case <-c:
-			close(done)
-		case <-done:
-		}
+		<-c
+		closeDoneOnce.Do(func() { close(done) })
 	}()
 
-	if err := prog.Register(0, xsk.FD()); err != nil {
-		log.Fatalf("Register socket in program: %v", err)
-	}
+	// Global stats
+	var totalTx, totalRx, completedCount, openCount, closedCount, rawPacketCount uint64
 
-	// Enable kernel busy polling on this socket (microseconds) and prefer busy poll
-	const busyPollTime = 50 // 50 usec; tune as needed
-	if err := unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollTime); err != nil {
-		log.Printf("SO_BUSY_POLL set failed (kernel <3.11 or unsupported): %v", err)
-	}
-	if err := unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_PREFER_BUSY_POLL, 1); err != nil {
-		log.Printf("SO_PREFER_BUSY_POLL set failed: %v", err)
-	}
-
+	// Randomize scan order
 	rand.Seed(time.Now().UnixNano())
-
-	// Randomize scan order to be less predictable and nicer to networks
 	rand.Shuffle(len(dests), func(i, j int) {
 		dests[i], dests[j] = dests[j], dests[i]
 	})
 
-	log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s", len(dests), len(ips), len(ports), ifaceName)
-
-	// Record start time for throughput calculation later.
+	log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s using %d queues and %d workers",
+		len(dests), len(ips), len(ports), ifaceName, numQueues, numWorkers)
 	startTime := time.Now()
 
-	// Map to quickly find dest by ip:port string
-	outstanding := make(map[destKey]*dest, len(dests))
-	var outstandingMu sync.RWMutex
-	// Time-ordered list for efficient timeout handling.
-	timeoutQueue := list.New()
-	for _, d := range dests {
-		key := makeDestKey(d.ip, d.port)
-		d.key = key
-		outstanding[key] = d
-		d.isQueued = true // It is now in the pending queue
+	// Start Result Processor (must start before others)
+	var resultWg sync.WaitGroup
+	resultWg.Add(1)
+	go resultProcessor(done, &resultWg, retryTimeout, maxRetries, verbose, showClosed,
+		&completedCount, &openCount, &closedCount, len(dests))
+
+	// Start I/O Worker
+	var ioWg sync.WaitGroup
+	ioWg.Add(1)
+	go ioWorker(done, &ioWg, iface.Attrs().Index, prog, numQueues, ringSize, srcMAC, gatewayMAC, srcIP, srcPort,
+		verbose, &totalTx, &totalRx)
+
+	// Start Logic Workers
+	var logicWg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		logicWg.Add(1)
+		go logicWorker(done, &logicWg, getWorkerDests(dests, i, numWorkers), i)
 	}
 
-	// Stats tracking
-	var totalTx, totalRx, completedCount, openCount, closedCount, rawPacketCount uint64
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Stats reporting goroutine
+	var statsWg sync.WaitGroup
+	statsWg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer statsWg.Done()
 		var lastTx, lastRx, lastCompleted uint64
 		lastTime := time.Now()
-		ticker := time.NewTicker(2 * time.Second) // Report every 2s for less noise
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -299,9 +273,7 @@ func main() {
 				rxPps := float64(currentRx-lastRx) / elapsed.Seconds()
 				scansPerSec := float64(currentCompleted-lastCompleted) / elapsed.Seconds()
 
-				outstandingMu.RLock()
-				outstandingCount := len(outstanding)
-				outstandingMu.RUnlock()
+				outstandingCount := len(dests) - int(currentCompleted)
 
 				log.Printf("Stats: TX %.0f pps, RX %.0f pps (Raw: %d), Scans %.0f/s | Outstanding: %d | Open: %d, Closed: %d",
 					txPps, rxPps, rawRx, scansPerSec, outstandingCount, currentOpen, currentClosed)
@@ -310,268 +282,345 @@ func main() {
 				lastRx = currentRx
 				lastCompleted = currentCompleted
 				lastTime = now
+
+				if currentCompleted >= uint64(len(dests)) {
+					return
+				}
 			case <-done:
 				return
 			}
 		}
 	}()
 
-	// Pre-fill RX descriptors
-	fillDescs := xsk.GetDescs(cap(xsk.GetDescs(0, true)), true)
-	if len(fillDescs) > 0 {
-		xsk.Fill(fillDescs)
+	// Wait for logic workers to finish generating requests
+	logicWg.Wait()
+	log.Println("All logic workers finished")
+
+	// Wait for all work to complete
+	for {
+		completed := atomic.LoadUint64(&completedCount)
+		if completed >= uint64(len(dests)) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	runtime.LockOSThread() // dedicate scanning loop to this core
+	// Signal shutdown
+	closeDoneOnce.Do(func() { close(done) })
 
-	nextDestIndex := 0
-	var retryDests []*dest
-	var retryNextIndex int
-	// Buffered channel for results to decouple printing from the receiver loop.
-	resultsChan := make(chan string, 4096)
-	var printerWg sync.WaitGroup
-	printerWg.Add(1)
-	go func() {
-		defer printerWg.Done()
-		for result := range resultsChan {
-			fmt.Println(result)
-		}
-	}()
-
-	// Create the packet packer
-	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, srcPort)
-	if err != nil {
-		log.Fatalf("failed to create syn packet generator: %v", err)
-	}
-
-	// Start a separate goroutine to handle timeouts and retries.
-	var timeoutWg sync.WaitGroup
-	timeoutWg.Add(1)
-	go func() {
-		defer timeoutWg.Done()
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				outstandingMu.Lock()
-				// Check the front of the queue without removing.
-				front := timeoutQueue.Front()
-				if front == nil {
-					// Queue is empty, wait for a bit.
-					outstandingMu.Unlock()
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-
-				var target *dest
-				target = front.Value.(*dest)
-				if time.Since(target.lastSent) < retryTimeout {
-					// Head of the queue hasn't timed out, so nothing else has either.
-					outstandingMu.Unlock()
-					// Sleep until the head is expected to time out.
-					sleepTime := retryTimeout - time.Since(target.lastSent)
-					time.Sleep(sleepTime)
-					continue
-				}
-
-				// The head has timed out. Process it and any others that have also timed out.
-				timeoutQueue.Remove(front)
-				if target.retries >= maxRetries {
-					if verbose {
-						resultsChan <- fmt.Sprintf("[DEBUG] Filtered: %s:%d", target.ip, target.port)
-					}
-					target.status = "filtered"
-					delete(outstanding, target.key)
-					atomic.AddUint64(&completedCount, 1)
-				} else {
-					if !target.isQueued {
-						retryDests = append(retryDests, target)
-						target.isQueued = true
-					}
-				}
-				outstandingMu.Unlock()
-			}
-		}
-	}()
-
-	// Decouple receiver logic into its own goroutine to allow the sender to
-	// run at full speed without being blocked by receive logic.
-	var receiverWg sync.WaitGroup
-	receiverWg.Add(1)
-	go func() {
-		defer receiverWg.Done()
-		runtime.LockOSThread() // Dedicate a core to receiving
-
-		for {
-			select {
-			case <-done:
-				return
-			default:
-			}
-
-			// Poll with a timeout to remain responsive to the 'done' channel.
-			numRx, _, err := xsk.Poll(100) // 100ms timeout
-			if err != nil {
-				if err == unix.EAGAIN || err == unix.EINTR {
-					continue // Expected on timeout
-				}
-				if err == unix.EBADF {
-					return // Socket closed
-				}
-				log.Printf("Receiver poll error: %v", err)
-				continue
-			}
-
-			if numRx > 0 {
-				atomic.AddUint64(&rawPacketCount, uint64(numRx))
-				rxDescs := xsk.Receive(numRx)
-				processedPackets := 0
-				for _, d := range rxDescs {
-					frame := xsk.GetFrame(d)
-					if ip, port, status := processPacket(frame, srcPort, verbose); status != "" {
-						key := makeDestKey(ip, port)
-						outstandingMu.Lock()
-						if target, ok := outstanding[key]; ok {
-							if target.status == "unknown" { // Avoid race with timeout
-								target.status = status
-								delete(outstanding, key)
-								// Remove from timeout queue to prevent it from being marked as filtered.
-								if target.timeoutElem != nil {
-									timeoutQueue.Remove(target.timeoutElem)
-								}
-
-								atomic.AddUint64(&completedCount, 1)
-								if status == "open" {
-									atomic.AddUint64(&openCount, 1)
-									resultsChan <- fmt.Sprintf("OPEN: %s:%d", target.ip, target.port)
-								} else if status == "closed" {
-									atomic.AddUint64(&closedCount, 1)
-									if showClosed {
-										resultsChan <- fmt.Sprintf("CLOSED: %s:%d", target.ip, target.port)
-									}
-								}
-								processedPackets++
-							}
-						}
-						outstandingMu.Unlock()
-					}
-				}
-				atomic.AddUint64(&totalRx, uint64(processedPackets))
-				xsk.Fill(rxDescs)
-			}
-			outstandingMu.RLock()
-			outstandingCount := len(outstanding)
-			outstandingMu.RUnlock()
-			if outstandingCount == 0 {
-				break
-			}
-		}
-	}()
-
-	outstandingMu.RLock()
-	outstandingCount := len(outstanding)
-	outstandingMu.RUnlock()
-
-	var seq uint32
-	for outstandingCount > 0 {
-		// Always check for completions first, even if we can't send packets
-		_, completed, err := xsk.Poll(0) // Use non-blocking poll for completions
-		if err != nil && err != unix.EAGAIN {
-			log.Printf("Poll error: %v", err)
-		}
-		if completed > 0 {
-			xsk.Complete(completed)
-		}
-
-		// 1. Send packets
-		numFree := xsk.NumFreeTxSlots()
-		if numFree > 0 {
-			descs := xsk.GetDescs(min(numFree, BATCH_SIZE), false)
-			if len(descs) > 0 {
-				packetsToSend := 0
-				for i := range descs {
-					outstandingMu.Lock()
-					if retryNextIndex < len(retryDests) {
-						target = retryDests[retryNextIndex]
-						retryNextIndex++
-					} else if nextDestIndex < len(dests) {
-						target = dests[nextDestIndex]
-						nextDestIndex++
-					} else {
-						// No more packets to send for now
-						if retryNextIndex > 0 && retryNextIndex == len(retryDests) {
-							// We have processed all retries in the current batch, clear the slice for the next one
-							retryDests = retryDests[:0]
-							retryNextIndex = 0
-						}
-						outstandingMu.Unlock()
-						break
-					}
-
-					// Mark the destination as no longer queued for retry
-					target.isQueued = false
-
-					// Update timing and retry metadata under the same lock to avoid races with the timeout goroutine.
-					target.lastSent = time.Now()
-					target.retries++
-					// Enqueue the destination in the timeout list and keep the returned element for later removal.
-					target.timeoutElem = timeoutQueue.PushBack(target)
-					outstandingMu.Unlock()
-
-					// Get the XDP frame and pack the packet directly into it, avoiding a copy.
-					frame := xsk.GetFrame(descs[i])
-					pktLen := len(packer.template)
-					packer.pack(frame[:pktLen], target.ip, target.port, seq)
-					seq += 0x01000193 // FNV prime, any odd increment works
-
-					// Set the frame length for transmission
-					descs[i].Len = uint32(pktLen)
-					packetsToSend++
-				}
-
-				if packetsToSend > 0 {
-					xsk.Transmit(descs[:packetsToSend])
-					// The non-blocking poll at the top of the loop is enough to kick the
-					// kernel to start processing packets. A blocking poll here would
-					// stall the send loop and starve the completion ring.
-					atomic.AddUint64(&totalTx, uint64(packetsToSend))
-				}
-			}
-		}
-
-		// Let the sender loop yield to the OS scheduler briefly if it's running too hot
-		// and not finding free slots. This can prevent live-locking on the CPU.
-		if numFree == 0 {
-			runtime.Gosched()
-		}
-
-		outstandingMu.RLock()
-		outstandingCount = len(outstanding)
-		outstandingMu.RUnlock()
-	}
-	runtime.UnlockOSThread()
+	// Wait for other components
+	ioWg.Wait()
+	resultWg.Wait()
+	statsWg.Wait()
 
 	elapsed := time.Since(startTime).Seconds()
-	log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.", atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
+	log.Printf("Scan complete. %d ports processed. Total packets transmitted: %d.",
+		atomic.LoadUint64(&completedCount), atomic.LoadUint64(&totalTx))
 	if elapsed > 0 {
 		pps := float64(atomic.LoadUint64(&totalTx)) / elapsed
 		log.Printf("Average TX rate: %.0f packets/sec (elapsed %.2f s)", pps, elapsed)
 	}
-	close(done)
 
-	// Wait for all worker goroutines to finish before cleaning up.
-	wg.Wait()
-	timeoutWg.Wait()
-	receiverWg.Wait()
-
-	// Now that all goroutines are done, we can close the results channel and wait for the printer.
-	close(resultsChan)
-	printerWg.Wait()
-
-	// All goroutines have finished; now it is safe to clean up the socket and detach the XDP program.
-	cleanup()
+	// Cleanup
+	log.Println("Detaching XDP program and closing resources...")
+	cmd := exec.Command("ip", "link", "set", "dev", ifaceName, "xdp", "off")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: could not run '%s': %v. Output: %s", cmd.String(), err, string(out))
+	}
+	cmd = exec.Command("ip", "link", "set", "dev", ifaceName, "xdpgeneric", "off")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: could not run '%s': %v. Output: %s", cmd.String(), err, string(out))
+	}
 	log.Println("Cleanup complete.")
+}
+
+// Logic Worker: generates packet requests for its assigned destinations
+func logicWorker(done <-chan struct{}, wg *sync.WaitGroup, dests []*dest, workerID int) {
+	defer wg.Done()
+
+	for _, target := range dests {
+		select {
+		case <-done:
+			return
+		case packetRequestChan <- PacketRequest{IP: target.ip, Port: target.port}:
+			// Also notify the result processor to track this target
+			select {
+			case stateRequestChan <- StateRequest{
+				IP:       target.ip,
+				Port:     target.port,
+				Action:   "add",
+				LastSent: time.Now(),
+				Retries:  1,
+			}:
+			case <-done:
+				return
+			}
+		}
+	}
+}
+
+// I/O Worker: handles all XDP socket operations
+func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.Program, numQueues, ringSize int,
+	srcMAC, gatewayMAC net.HardwareAddr, srcIP net.IP, srcPort int, verbose bool, totalTx, totalRx *uint64) {
+	defer wg.Done()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Create XDP sockets for all queues
+	var sockets []*xdp.Socket
+	socketOptions := xdp.SocketOptions{
+		NumFrames:              ringSize * 2,
+		FrameSize:              4096,
+		FillRingNumDescs:       ringSize,
+		CompletionRingNumDescs: ringSize,
+		RxRingNumDescs:         ringSize,
+		TxRingNumDescs:         ringSize,
+	}
+
+	for i := 0; i < numQueues; i++ {
+		xsk, err := xdp.NewSocket(ifIndex, i, &socketOptions)
+		if err != nil {
+			log.Fatalf("NewSocket for queue %d: %v", i, err)
+		}
+		defer xsk.Close()
+
+		if err := prog.Register(i, xsk.FD()); err != nil {
+			log.Fatalf("Register socket for queue %d: %v", i, err)
+		}
+		defer prog.Unregister(i)
+
+		// Busy polling
+		const busyPollTime = 50
+		unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollTime)
+		unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_PREFER_BUSY_POLL, 1)
+
+		sockets = append(sockets, xsk)
+	}
+
+	packer, err := newSynPacker(srcMAC, gatewayMAC, srcIP, uint16(srcPort))
+	if err != nil {
+		log.Fatalf("failed to create syn packet generator: %v", err)
+	}
+
+	// Pre-fill RX rings
+	for _, xsk := range sockets {
+		if fillDescs := xsk.GetDescs(xsk.NumFreeFillSlots(), true); len(fillDescs) > 0 {
+			xsk.Fill(fillDescs)
+		}
+	}
+
+	var (
+		requestsToSend []PacketRequest
+		seq            uint32 = rand.Uint32()
+		currentQueue   int    = 0
+	)
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		// 1. Poll for completions and receives FIRST to free up TX slots.
+		for i, xsk := range sockets {
+			numRx, numComp, err := xsk.Poll(0)
+			if err != nil && err != unix.EAGAIN && err != unix.EINTR && err != unix.EBADF {
+				log.Printf("Poll error on queue %d: %v", i, err)
+			}
+			if numComp > 0 {
+				xsk.Complete(numComp)
+			}
+			// Only check for receives on queue 0 where BPF redirects
+			if numRx > 0 {
+				rxDescs := xsk.Receive(numRx)
+				processedPackets := 0
+				for _, d := range rxDescs {
+					frame := xsk.GetFrame(d)
+					if ip, port, status := processPacket(frame, srcPort, numQueues, verbose); status != "" {
+						select {
+						case resultChan <- ScanResult{IP: ip, Port: port, Status: status}:
+							processedPackets++
+						case <-done:
+							return
+						}
+					}
+				}
+				if processedPackets > 0 {
+					atomic.AddUint64(totalRx, uint64(processedPackets))
+					xsk.Fill(rxDescs)
+				}
+			}
+		}
+
+		// 2. Top up our internal send buffer with new requests.
+	GetNewRequests:
+		for len(requestsToSend) < BATCH_SIZE*2 { // Keep a backlog
+			select {
+			case req := <-packetRequestChan:
+				requestsToSend = append(requestsToSend, req)
+			default:
+				break GetNewRequests
+			}
+		}
+
+		// 3. Send packets from our buffer.
+		if len(requestsToSend) > 0 {
+			xsk := sockets[currentQueue]
+			numFree := xsk.NumFreeTxSlots()
+
+			if numFree > 0 {
+				numToSend := min(numFree, len(requestsToSend))
+				descs := xsk.GetDescs(numToSend, false)
+				numToSend = len(descs)
+
+				portForThisQueue := uint16(srcPort + currentQueue)
+
+				for i := 0; i < numToSend; i++ {
+					req := requestsToSend[i]
+					frame := xsk.GetFrame(descs[i])
+					pktLen := len(packer.template)
+					packer.pack(frame[:pktLen], req.IP, portForThisQueue, req.Port, seq)
+					seq += 0x01000193
+					descs[i].Len = uint32(pktLen)
+				}
+
+				if numToSend > 0 {
+					xsk.Transmit(descs)
+					atomic.AddUint64(totalTx, uint64(numToSend))
+					requestsToSend = requestsToSend[numToSend:]
+				}
+			}
+			currentQueue = (currentQueue + 1) % numQueues
+		}
+
+		// 4. Yield if we have nothing to do.
+		if len(requestsToSend) == 0 && len(packetRequestChan) == 0 {
+			runtime.Gosched()
+		}
+	}
+}
+
+// Result Processor: manages all state and handles results
+func resultProcessor(done <-chan struct{}, wg *sync.WaitGroup, retryTimeout time.Duration, maxRetries int,
+	verbose, showClosed bool, completedCount, openCount, closedCount *uint64, totalTargets int) {
+	defer wg.Done()
+
+	outstanding := make(map[destKey]*dest)
+	timeoutQueue := list.New()
+
+	// Use a ticker inside the main select loop to handle timeouts.
+	ticker := time.NewTicker(retryTimeout / 10) // Check 10x more frequently than timeout
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+
+		case <-ticker.C:
+			now := time.Now()
+			for {
+				front := timeoutQueue.Front()
+				if front == nil {
+					break // No items in queue
+				}
+
+				target := front.Value.(*dest)
+				if now.Sub(target.lastSent) < retryTimeout {
+					break // Head of the queue hasn't timed out yet
+				}
+
+				// This target has timed out
+				timeoutQueue.Remove(front)
+
+				if target.retries >= maxRetries {
+					if verbose {
+						log.Printf("Filtered: %s:%d", target.ip, target.port)
+					}
+					target.status = "filtered"
+					delete(outstanding, target.key)
+					atomic.AddUint64(completedCount, 1)
+				} else {
+					// Retry: send back to the packet request channel
+					select {
+					case packetRequestChan <- PacketRequest{IP: target.ip, Port: target.port}:
+						// If retry is successful, update state and re-queue for timeout check
+						target.retries++
+						target.lastSent = now
+						target.timeoutElem = timeoutQueue.PushBack(target)
+					case <-done:
+						return
+					}
+				}
+			}
+
+		case req := <-stateRequestChan:
+			if req.Action == "add" {
+				key := makeDestKey(req.IP, req.Port)
+				target := &dest{
+					key:      key,
+					ip:       req.IP,
+					port:     req.Port,
+					status:   "unknown",
+					retries:  req.Retries,
+					lastSent: req.LastSent,
+				}
+				target.timeoutElem = timeoutQueue.PushBack(target)
+				outstanding[key] = target
+			}
+		case result := <-resultChan:
+			key := makeDestKey(result.IP, result.Port)
+			if target, ok := outstanding[key]; ok {
+				target.status = result.Status
+				delete(outstanding, key)
+
+				if target.timeoutElem != nil {
+					timeoutQueue.Remove(target.timeoutElem)
+				}
+
+				atomic.AddUint64(completedCount, 1)
+
+				if result.Status == "open" {
+					atomic.AddUint64(openCount, 1)
+					fmt.Printf("OPEN: %s:%d\n", result.IP, result.Port)
+				} else if result.Status == "closed" {
+					atomic.AddUint64(closedCount, 1)
+					if showClosed {
+						fmt.Printf("CLOSED: %s:%d\n", result.IP, result.Port)
+					}
+				}
+			}
+		}
+	}
+}
+
+// getWorkerDests slices the main destination list to distribute work among workers.
+func getWorkerDests(dests []*dest, workerID, numWorkers int) []*dest {
+	n := len(dests)
+	start := (n * workerID) / numWorkers
+	end := (n * (workerID + 1)) / numWorkers
+	return dests[start:end]
+}
+
+// configureInterfaceQueues uses ethtool to set the number of combined queues.
+func configureInterfaceQueues(ifaceName string, numQueues int, verbose bool) error {
+	ethtoolPath, err := exec.LookPath("ethtool")
+	if err != nil {
+		return fmt.Errorf("'ethtool' not found, cannot configure interface queues. Please install it")
+	}
+
+	if verbose {
+		log.Printf("Setting interface '%s' to use %d combined queues", ifaceName, numQueues)
+	}
+
+	// Example: ethtool -L enp0s3 combined 4
+	cmd := exec.Command(ethtoolPath, "-L", ifaceName, "combined", strconv.Itoa(numQueues))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to set queues with '%s': %v. Output: %s", cmd.String(), err, string(out))
+	}
+	return nil
 }
 
 func parseIPsAndCIDRs(s string) ([]net.IP, error) {
@@ -644,26 +693,6 @@ func inc(ip net.IP) {
 	}
 }
 
-type destKey [18]byte // 16 for IP, 2 for port
-
-func makeDestKey(ip net.IP, port uint16) destKey {
-	var key destKey
-	copy(key[:16], ip.To16())
-	binary.BigEndian.PutUint16(key[16:], port)
-	return key
-}
-
-type dest struct {
-	key         destKey
-	ip          net.IP
-	port        uint16
-	status      string // unknown, open, closed, filtered
-	retries     int
-	lastSent    time.Time
-	isQueued    bool
-	timeoutElem *list.Element
-}
-
 func parsePorts(s string) ([]uint16, error) {
 	var res []uint16
 	for _, part := range strings.Split(s, ",") {
@@ -693,8 +722,28 @@ func parsePorts(s string) ([]uint16, error) {
 	return res, nil
 }
 
-// processPacket inspects packet, returns target key if SYN-ACK observed
-func processPacket(pkt []byte, srcPort int, verbose bool) (ip net.IP, port uint16, status string) {
+type destKey [18]byte // 16 for IP, 2 for port
+
+func makeDestKey(ip net.IP, port uint16) destKey {
+	var key destKey
+	copy(key[:16], ip.To16())
+	binary.BigEndian.PutUint16(key[16:], port)
+	return key
+}
+
+type dest struct {
+	key         destKey
+	ip          net.IP
+	port        uint16
+	status      string // unknown, open, closed, filtered
+	retries     int
+	lastSent    time.Time
+	isQueued    bool
+	timeoutElem *list.Element
+}
+
+// processPacket inspects a raw packet and determines the port status.
+func processPacket(pkt []byte, baseSrcPort int, numQueues int, verbose bool) (ip net.IP, port uint16, status string) {
 	if len(pkt) < 34 { // Ethernet + IPv4 min
 		return
 	}
@@ -712,7 +761,7 @@ func processPacket(pkt []byte, srcPort int, verbose bool) (ip net.IP, port uint1
 	tcpStart := 14 + ipHeaderLen
 	srcPortPkt := int(pkt[tcpStart])<<8 | int(pkt[tcpStart+1])
 	dstPortPkt := int(pkt[tcpStart+2])<<8 | int(pkt[tcpStart+3])
-	if dstPortPkt != srcPort { // only care replies to our src port
+	if dstPortPkt < baseSrcPort || dstPortPkt >= baseSrcPort+numQueues {
 		return
 	}
 	flags := pkt[tcpStart+13]
@@ -732,7 +781,6 @@ func processPacket(pkt []byte, srcPort int, verbose bool) (ip net.IP, port uint1
 }
 
 // getMACFromCache reads the system's ARP table to find the MAC address for a given IP.
-// This is much faster than sending an ARP request.
 func getMACFromCache(ifaceName string, ip net.IP, verbose bool) (net.HardwareAddr, error) {
 	file, err := os.Open("/proc/net/arp")
 	if err != nil {
@@ -784,8 +832,6 @@ func getGatewayMAC(ifaceName string, srcIP, gatewayIP net.IP, verbose bool) (net
 		log.Println("Gateway MAC not in cache, sending ARP request.")
 	}
 
-	// The arping library provides a more robust way to send ARP requests and get replies.
-	// It handles the raw socket creation and packet parsing for us.
 	mac, _, err = arping.Ping(gatewayIP)
 	if err != nil {
 		return nil, fmt.Errorf("arping failed: %w", err)
@@ -809,7 +855,6 @@ func getDefaultRoutes(verbose bool) ([]defaultRouteInfo, error) {
 	var routes []defaultRouteInfo
 
 	scanner := bufio.NewScanner(f)
-	// Skip header
 	if scanner.Scan() {
 		// Do nothing with the header line
 	}
@@ -832,10 +877,9 @@ func getDefaultRoutes(verbose bool) ([]defaultRouteInfo, error) {
 				if verbose {
 					log.Printf("Could not parse gateway hex '%s': %v", gatewayHex, err)
 				}
-				continue // Couldn't parse gateway address
+				continue
 			}
 
-			// The gateway address in /proc/net/route is in little-endian format.
 			gatewayIP := make(net.IP, 4)
 			binary.LittleEndian.PutUint32(gatewayIP, gw)
 
@@ -857,13 +901,13 @@ func getDefaultRoutes(verbose bool) ([]defaultRouteInfo, error) {
 	return routes, nil
 }
 
-// synPacker is used to quickly craft SYN packets by creating a template and
-// only modifying the necessary fields for each new packet.
+// synPacker is used to quickly craft SYN packets from a template.
 type synPacker struct {
 	template          []byte
 	ethHeaderLen      int
 	ipHeaderLen       int
 	ipDstOffset       int
+	tcpSrcPortOffset  int
 	tcpDstPortOffset  int
 	tcpSeqOffset      int
 	ipChecksumOffset  int
@@ -871,7 +915,7 @@ type synPacker struct {
 	pseudoHeader      []byte
 }
 
-func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*synPacker, error) {
+func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort uint16) (*synPacker, error) {
 	eth := &layers.Ethernet{
 		SrcMAC:       srcMAC,
 		DstMAC:       dstMAC,
@@ -892,7 +936,6 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*
 		SYN:     true,
 		Window:  1024,
 	}
-	// DstIP in ip is a placeholder, but for checksum calculation it's fine.
 	tcp.SetNetworkLayerForChecksum(ip)
 
 	buf := gopacket.NewSerializeBuffer()
@@ -909,12 +952,10 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*
 	ethHeaderLen := len(decodedPacket.Layer(layers.LayerTypeEthernet).LayerContents())
 	ipHeaderLen := int(ipLayer.IHL * 4)
 
-	// Manually construct the pseudo-header for checksum calculation, as
-	// gopacket does not expose this directly.
 	pseudoHeader := make([]byte, 12)
 	copy(pseudoHeader[0:4], ipLayer.SrcIP.To4())
 	copy(pseudoHeader[4:8], ipLayer.DstIP.To4()) // DstIP is a placeholder
-	pseudoHeader[8] = 0                          // Reserved
+	pseudoHeader[8] = 0
 	pseudoHeader[9] = byte(layers.IPProtocolTCP)
 	tcpLen := uint16(len(tcpLayer.Contents) + len(tcpLayer.Payload))
 	binary.BigEndian.PutUint16(pseudoHeader[10:12], tcpLen)
@@ -923,11 +964,12 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*
 		template:          packetBytes,
 		ethHeaderLen:      ethHeaderLen,
 		ipHeaderLen:       ipHeaderLen,
-		ipDstOffset:       ethHeaderLen + 16,               // DstIP is at byte 16 of IP header
-		tcpDstPortOffset:  ethHeaderLen + ipHeaderLen + 2,  // DstPort is at byte 2 of TCP header
-		tcpSeqOffset:      ethHeaderLen + ipHeaderLen + 4,  // Seq is at byte 4
-		ipChecksumOffset:  ethHeaderLen + 10,               // Checksum is at byte 10 of IP header
-		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16, // Checksum is at byte 16 of TCP header
+		ipDstOffset:       ethHeaderLen + 16,
+		tcpSrcPortOffset:  ethHeaderLen + ipHeaderLen,
+		tcpDstPortOffset:  ethHeaderLen + ipHeaderLen + 2,
+		tcpSeqOffset:      ethHeaderLen + ipHeaderLen + 4,
+		ipChecksumOffset:  ethHeaderLen + 10,
+		tcpChecksumOffset: ethHeaderLen + ipHeaderLen + 16,
 		pseudoHeader:      pseudoHeader,
 	}
 
@@ -935,13 +977,12 @@ func newSynPacker(srcMAC, dstMAC net.HardwareAddr, srcIP net.IP, srcPort int) (*
 }
 
 // pack quickly constructs a packet by modifying the template.
-// It performs checksum calculation in software to avoid issues with
-// hardware offloading, which can be unreliable.
-func (p *synPacker) pack(pktBuf []byte, dstIP net.IP, dstPort uint16, seq uint32) {
+func (p *synPacker) pack(pktBuf []byte, dstIP net.IP, srcPort, dstPort uint16, seq uint32) {
 	copy(pktBuf, p.template)
 
 	// Update headers
 	copy(pktBuf[p.ipDstOffset:p.ipDstOffset+4], dstIP.To4())
+	binary.BigEndian.PutUint16(pktBuf[p.tcpSrcPortOffset:p.tcpSrcPortOffset+2], srcPort)
 	binary.BigEndian.PutUint16(pktBuf[p.tcpDstPortOffset:p.tcpDstPortOffset+2], dstPort)
 	binary.BigEndian.PutUint32(pktBuf[p.tcpSeqOffset:p.tcpSeqOffset+4], seq)
 
@@ -950,13 +991,14 @@ func (p *synPacker) pack(pktBuf []byte, dstIP net.IP, dstPort uint16, seq uint32
 	binary.BigEndian.PutUint16(pktBuf[p.tcpChecksumOffset:p.tcpChecksumOffset+2], 0)
 
 	// Software checksum calculation
-	// Recalculate IP checksum
 	ipHeader := pktBuf[p.ethHeaderLen : p.ethHeaderLen+p.ipHeaderLen]
 	ipCsum := checksum(ipHeader)
 	binary.BigEndian.PutUint16(pktBuf[p.ipChecksumOffset:p.ipChecksumOffset+2], ipCsum)
 
 	// Recalculate TCP checksum
-	copy(p.pseudoHeader[4:8], dstIP.To4()) // DstIP is part of pseudo-header
+	copy(p.pseudoHeader[4:8], dstIP.To4())
+	// The TCP pseudo-header's src/dst IP is already set from the template.
+	// We only need to update the dstIP for the TCP checksum calculation part.
 	tcpSegment := pktBuf[p.ethHeaderLen+p.ipHeaderLen:]
 	tcpCsum := tcpChecksum(p.pseudoHeader, tcpSegment)
 	binary.BigEndian.PutUint16(pktBuf[p.tcpChecksumOffset:p.tcpChecksumOffset+2], tcpCsum)
@@ -977,8 +1019,7 @@ func checksum(buf []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// tcpPseudoHeaderChecksum calculates only the checksum of the TCP pseudo-header.
-// This is used with checksum offloading.
+// tcpPseudoHeaderChecksum calculates the checksum of the TCP pseudo-header.
 func tcpPseudoHeaderChecksum(pseudoHeader []byte) uint16 {
 	sum := uint32(0)
 	for i := 0; i < len(pseudoHeader)-1; i += 2 {
@@ -994,12 +1035,10 @@ func tcpPseudoHeaderChecksum(pseudoHeader []byte) uint16 {
 func tcpChecksum(pseudoHeader, tcpSegment []byte) uint16 {
 	sum := uint32(0)
 
-	// Pseudo-header
 	for i := 0; i < len(pseudoHeader)-1; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(pseudoHeader[i:]))
 	}
 
-	// TCP segment
 	for i := 0; i < len(tcpSegment)-1; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(tcpSegment[i:]))
 	}
@@ -1028,7 +1067,6 @@ func checkAndEnableChecksumOffloading(ifaceName string, verbose bool) bool {
 		return false
 	}
 
-	// isOffloadEnabled checks the current state of TX checksumming.
 	isOffloadEnabled := func() bool {
 		cmd := exec.Command(ethtoolPath, "-k", ifaceName)
 		out, err := cmd.CombinedOutput()
@@ -1036,10 +1074,9 @@ func checkAndEnableChecksumOffloading(ifaceName string, verbose bool) bool {
 			if verbose {
 				log.Printf("Could not check offloading features with 'ethtool -k': %v", err)
 			}
-			return false // Assume disabled if we can't check
+			return false
 		}
-		// Modern ethtool uses 'tx-checksum-ip-generic', older might show 'tx-checksumming'.
-		// We look for either being 'on'.
+
 		output := string(out)
 		return strings.Contains(output, "tx-checksum-ip-generic: on") || strings.Contains(output, "tx-checksumming: on")
 	}
@@ -1050,7 +1087,6 @@ func checkAndEnableChecksumOffloading(ifaceName string, verbose bool) bool {
 	}
 
 	log.Println("Attempting to enable hardware TX checksum offloading for performance...")
-	// Using 'tx on' is a general way to enable TCP/UDP/SCTP checksum offload on transmit.
 	cmd := exec.Command(ethtoolPath, "-K", ifaceName, "tx", "on")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("Warning: Failed to enable TX checksum offloading with 'ethtool -K %s tx on'. Error: %v", ifaceName, err)
@@ -1061,7 +1097,6 @@ func checkAndEnableChecksumOffloading(ifaceName string, verbose bool) bool {
 		return false
 	}
 
-	// Verify that it was enabled
 	if isOffloadEnabled() {
 		log.Println("Successfully enabled hardware TX checksum offloading.")
 		return true
