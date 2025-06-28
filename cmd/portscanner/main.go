@@ -14,13 +14,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/google/gopacket"
@@ -56,12 +54,160 @@ type StateRequest struct {
 	Retries  int
 }
 
+// SystemTimers holds atomic counters for detailed performance analysis.
+type SystemTimers struct {
+	ioSendNs        uint64
+	ioRecvNs        uint64
+	ioWaitNs        uint64
+	logicWaitNs     uint64
+	resultProcNs    uint64
+	resultTimeoutNs uint64
+}
+
 // Global channels for communication between components
 var (
 	packetRequestChan = make(chan PacketRequest, 16384)
 	resultChan        = make(chan ScanResult, 8192)
 	stateRequestChan  = make(chan StateRequest, 16384)
 )
+
+// IPTarget represents a scannable entity, either a single IP or a CIDR block.
+type IPTarget interface {
+	GetIP(index uint64) net.IP
+	Count() uint64
+	String() string
+}
+
+// SingleIPTarget represents a single IP address.
+type SingleIPTarget struct {
+	IP net.IP
+}
+
+func (s *SingleIPTarget) GetIP(index uint64) net.IP {
+	if index == 0 {
+		return s.IP
+	}
+	return nil
+}
+
+func (s *SingleIPTarget) Count() uint64 {
+	return 1
+}
+
+func (s *SingleIPTarget) String() string {
+	return s.IP.String()
+}
+
+// CIDRTarget represents a CIDR network block.
+type CIDRTarget struct {
+	ipNet        *net.IPNet
+	firstIP      uint32
+	numUsableIPs uint64
+}
+
+// NewCIDRTarget creates a new target for a CIDR range, calculating the usable IP range.
+func NewCIDRTarget(ipnet *net.IPNet) *CIDRTarget {
+	maskSize, bits := ipnet.Mask.Size()
+	var numIPs uint64
+	if bits == 32 {
+		numIPs = uint64(1) << (32 - maskSize)
+	} else {
+		return nil // IPv6 not supported
+	}
+
+	startIP := ipnet.IP.Mask(ipnet.Mask)
+	var numUsableIPs uint64
+
+	// For subnets smaller than /31, skip network and broadcast addresses.
+	if bits == 32 && maskSize < 31 {
+		if numIPs > 2 {
+			numUsableIPs = numIPs - 2
+			inc(startIP) // Skip network address to get first usable IP
+		} else {
+			numUsableIPs = 0 // /31 has 2 IPs, handled below. /32 has 1.
+		}
+	} else {
+		// For /31 and /32, all IPs are considered usable.
+		numUsableIPs = numIPs
+	}
+
+	if startIP.To4() == nil {
+		return nil
+	}
+
+	return &CIDRTarget{
+		ipNet:        ipnet,
+		firstIP:      binary.BigEndian.Uint32(startIP.To4()),
+		numUsableIPs: numUsableIPs,
+	}
+}
+
+func (c *CIDRTarget) GetIP(index uint64) net.IP {
+	if index >= c.numUsableIPs {
+		return nil
+	}
+	ipVal := c.firstIP + uint32(index)
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, ipVal)
+	return ip
+}
+
+func (c *CIDRTarget) Count() uint64 {
+	return c.numUsableIPs
+}
+
+func (c *CIDRTarget) String() string {
+	return c.ipNet.String()
+}
+
+// DestGenerator creates destination (IP, Port) pairs on demand from a set of targets.
+type DestGenerator struct {
+	targets []IPTarget
+	ports   []uint16
+	// cumulativeIPs stores the total IP count up to the start of each target.
+	cumulativeIPs []uint64
+	totalIPs      uint64
+	totalPorts    uint64
+}
+
+// NewDestGenerator creates a generator for all scan combinations.
+func NewDestGenerator(targets []IPTarget, ports []uint16) *DestGenerator {
+	g := &DestGenerator{
+		targets:       targets,
+		ports:         ports,
+		cumulativeIPs: make([]uint64, len(targets)),
+		totalPorts:    uint64(len(ports)),
+	}
+	var currentTotal uint64
+	for i, t := range targets {
+		g.cumulativeIPs[i] = currentTotal
+		currentTotal += t.Count()
+	}
+	g.totalIPs = currentTotal
+	return g
+}
+
+// GetDestForIndex returns the IP and port for a given global scan index.
+// The index maps to a unique (IP, Port) combination.
+func (g *DestGenerator) GetDestForIndex(index uint64) (net.IP, uint16) {
+	if g.totalPorts == 0 || g.totalIPs == 0 {
+		return nil, 0
+	}
+
+	portIndex := index % g.totalPorts
+	ipIndex := index / g.totalPorts
+
+	port := g.ports[portIndex]
+
+	// Find the correct IP target for the global IP index.
+	for i, target := range g.targets {
+		if ipIndex < g.cumulativeIPs[i]+target.Count() {
+			ip := target.GetIP(ipIndex - g.cumulativeIPs[i])
+			return ip, port
+		}
+	}
+	return nil, 0 // Should not happen if index is within bounds
+}
 
 func main() {
 	var (
@@ -74,19 +220,24 @@ func main() {
 		maxRetries   int
 		showClosed   bool
 		ringSize     int
+		txRingSize   int
+		rxRingSize   int
 		numQueues    int
 		numWorkers   int
+		timers       SystemTimers
 	)
 
 	flag.StringVar(&ifaceName, "iface", "", "Network interface to use (mandatory)")
-	flag.StringVar(&ipsArg, "ips", "", "Comma separated list of target IPv4 addresses")
+	flag.StringVar(&ipsArg, "ips", "", "Comma separated list of target IPv4 addresses and CIDR blocks")
 	flag.StringVar(&portsArg, "ports", "1-1024", "Ports to scan, e.g. 80,443,1000-2000")
 	flag.IntVar(&srcPort, "srcport", 54321, "Source TCP port to use for SYN packets")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
 	flag.DurationVar(&retryTimeout, "retry-timeout", 1*time.Second, "Time to wait for a response before retrying a port")
 	flag.IntVar(&maxRetries, "retries", 3, "Number of retries for each port before marking as filtered")
 	flag.BoolVar(&showClosed, "show-closed", false, "Show closed ports in output")
-	flag.IntVar(&ringSize, "ring-size", 4096, "AF_XDP ring size (descs). Increase for higher throughput. Requires more locked memory.")
+	flag.IntVar(&ringSize, "ring-size", 4096, "Default AF_XDP ring size for all rings if not specified otherwise.")
+	flag.IntVar(&txRingSize, "tx-ring-size", 0, "Transmit/Completion ring size (defaults to ring-size).")
+	flag.IntVar(&rxRingSize, "rx-ring-size", 0, "Receive/Fill ring size (defaults to ring-size).")
 	flag.IntVar(&numQueues, "num-queues", 1, "Number of NIC queues to use for parallel scanning.")
 	flag.IntVar(&numWorkers, "workers", runtime.NumCPU(), "Number of logic worker goroutines")
 	flag.Parse()
@@ -96,13 +247,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Set specific ring sizes, defaulting to the general ring-size.
+	if txRingSize == 0 {
+		txRingSize = ringSize
+	}
+	if rxRingSize == 0 {
+		rxRingSize = ringSize
+	}
+
 	// Configure the network interface to use the specified number of queues.
 	if err := configureInterfaceQueues(ifaceName, numQueues, verbose); err != nil {
 		log.Fatalf("Could not configure interface queues: %v", err)
 	}
 
-	// Parse IPs
-	ips, err := parseIPsAndCIDRs(ipsArg)
+	// Parse IPs and CIDRs into targets.
+	ipTargets, err := parseIPTargets(ipsArg)
 	if err != nil {
 		log.Fatalf("could not parse 'ips' argument: %v", err)
 	}
@@ -113,13 +272,9 @@ func main() {
 		log.Fatalf("parse ports: %v", err)
 	}
 
-	// Build destination combinations
-	var dests []*dest
-	for _, ip := range ips {
-		for _, p := range ports {
-			dests = append(dests, &dest{ip: ip, port: p, status: "unknown"})
-		}
-	}
+	// Create a destination generator.
+	destGen := NewDestGenerator(ipTargets, ports)
+	totalScans := destGen.totalIPs * destGen.totalPorts
 
 	// Get link info
 	iface, err := netlink.LinkByName(ifaceName)
@@ -203,44 +358,42 @@ func main() {
 	done := make(chan struct{})
 	var closeDoneOnce sync.Once
 
-	// Setup signal handling
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-	go func() {
-		<-c
-		closeDoneOnce.Do(func() { close(done) })
-	}()
-
 	// Global stats
-	var totalTx, totalRx, completedCount, openCount, closedCount, rawPacketCount uint64
+	var totalTx, totalRx, completedCount, openCount, closedCount uint64
+	var totalResponseTimeNs, totalResponsesWithTime uint64 // For avg response time
 
-	// Randomize scan order
+	// Create and shuffle scan indices for randomization
+	scanIndices := make([]uint64, totalScans)
+	for i := uint64(0); i < totalScans; i++ {
+		scanIndices[i] = i
+	}
 	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(dests), func(i, j int) {
-		dests[i], dests[j] = dests[j], dests[i]
+	rand.Shuffle(len(scanIndices), func(i, j int) {
+		scanIndices[i], scanIndices[j] = scanIndices[j], scanIndices[i]
 	})
+	var sharedIndexCounter int64 = -1
 
 	log.Printf("Starting SYN scan to %d combinations (%d IPs × %d ports) via %s using %d queues and %d workers",
-		len(dests), len(ips), len(ports), ifaceName, numQueues, numWorkers)
+		totalScans, destGen.totalIPs, destGen.totalPorts, ifaceName, numQueues, numWorkers)
 	startTime := time.Now()
 
 	// Start Result Processor (must start before others)
 	var resultWg sync.WaitGroup
 	resultWg.Add(1)
 	go resultProcessor(done, &resultWg, retryTimeout, maxRetries, verbose, showClosed,
-		&completedCount, &openCount, &closedCount, len(dests))
+		&completedCount, &openCount, &closedCount, int(totalScans), &totalResponseTimeNs, &totalResponsesWithTime, &timers)
 
 	// Start I/O Worker
 	var ioWg sync.WaitGroup
 	ioWg.Add(1)
-	go ioWorker(done, &ioWg, iface.Attrs().Index, prog, numQueues, ringSize, srcMAC, gatewayMAC, srcIP, srcPort,
-		verbose, &totalTx, &totalRx)
+	go ioWorker(done, &ioWg, iface.Attrs().Index, prog, numQueues, txRingSize, rxRingSize, srcMAC, gatewayMAC, srcIP, srcPort,
+		verbose, &totalTx, &totalRx, &timers)
 
 	// Start Logic Workers
 	var logicWg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		logicWg.Add(1)
-		go logicWorker(done, &logicWg, getWorkerDests(dests, i, numWorkers), i)
+		go logicWorker(done, &logicWg, destGen, scanIndices, &sharedIndexCounter, i, int(totalScans), &timers)
 	}
 
 	// Stats reporting goroutine
@@ -248,8 +401,11 @@ func main() {
 	statsWg.Add(1)
 	go func() {
 		defer statsWg.Done()
-		var lastTx, lastRx, lastCompleted uint64
-		lastTime := time.Now()
+		var (
+			lastTx, lastRx, lastCompleted uint64
+			lastTimers                    SystemTimers
+			lastTime                      = time.Now()
+		)
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
@@ -257,33 +413,65 @@ func main() {
 			select {
 			case <-ticker.C:
 				now := time.Now()
-				elapsed := now.Sub(lastTime)
-				if elapsed == 0 {
-					continue
-				}
+				intervalNs := float64(now.Sub(lastTime).Nanoseconds())
+				lastTime = now
 
 				currentTx := atomic.LoadUint64(&totalTx)
 				currentRx := atomic.LoadUint64(&totalRx)
-				rawRx := atomic.LoadUint64(&rawPacketCount)
 				currentCompleted := atomic.LoadUint64(&completedCount)
-				currentOpen := atomic.LoadUint64(&openCount)
-				currentClosed := atomic.LoadUint64(&closedCount)
 
-				txPps := float64(currentTx-lastTx) / elapsed.Seconds()
-				rxPps := float64(currentRx-lastRx) / elapsed.Seconds()
-				scansPerSec := float64(currentCompleted-lastCompleted) / elapsed.Seconds()
+				txPps := float64(currentTx-lastTx) / (intervalNs / 1e9)
+				rxPps := float64(currentRx-lastRx) / (intervalNs / 1e9)
+				scansPerSec := float64(currentCompleted-lastCompleted) / (intervalNs / 1e9)
+				outstandingCount := int(totalScans) - int(currentCompleted)
 
-				outstandingCount := len(dests) - int(currentCompleted)
+				// Calculate average response time
+				avgRspTimeMs := 0.0
+				if responses := atomic.LoadUint64(&totalResponsesWithTime); responses > 0 {
+					avgRspTimeMs = float64(atomic.LoadUint64(&totalResponseTimeNs)) / float64(responses) / 1e6
+				}
 
-				log.Printf("Stats: TX %.0f pps, RX %.0f pps (Raw: %d), Scans %.0f/s | Outstanding: %d | Open: %d, Closed: %d",
-					txPps, rxPps, rawRx, scansPerSec, outstandingCount, currentOpen, currentClosed)
+				// Calculate time percentages
+				currentTimers := SystemTimers{
+					ioSendNs:        atomic.LoadUint64(&timers.ioSendNs),
+					ioRecvNs:        atomic.LoadUint64(&timers.ioRecvNs),
+					ioWaitNs:        atomic.LoadUint64(&timers.ioWaitNs),
+					logicWaitNs:     atomic.LoadUint64(&timers.logicWaitNs),
+					resultProcNs:    atomic.LoadUint64(&timers.resultProcNs),
+					resultTimeoutNs: atomic.LoadUint64(&timers.resultTimeoutNs),
+				}
+
+				ioSendPct := float64(currentTimers.ioSendNs-lastTimers.ioSendNs) / intervalNs * 100
+				ioRecvPct := float64(currentTimers.ioRecvNs-lastTimers.ioRecvNs) / intervalNs * 100
+				ioWaitPct := float64(currentTimers.ioWaitNs-lastTimers.ioWaitNs) / intervalNs * 100
+				logicWaitPct := float64(currentTimers.logicWaitNs-lastTimers.logicWaitNs) / intervalNs * 100
+				resultProcPct := float64(currentTimers.resultProcNs-lastTimers.resultProcNs) / intervalNs * 100
+				resultTimeoutPct := float64(currentTimers.resultTimeoutNs-lastTimers.resultTimeoutNs) / intervalNs * 100
+
+				lastTimers = currentTimers
+
+				log.Printf("Stats: TX %.0f pps, RX %.0f pps, Scans %.0f/s | Outstanding: %d | Avg Rsp: %.2fms",
+					txPps, rxPps, scansPerSec, outstandingCount, avgRspTimeMs)
+
+				var bottleneck string
+				if ioWaitPct > 50 {
+					bottleneck = "CPU Bound (Logic Workers)"
+				} else if logicWaitPct > 50 {
+					bottleneck = "I/O Bound (Network)"
+				} else {
+					bottleneck = "Balanced"
+				}
+
+				log.Printf("--> Bottleneck: %s | Timings (%%): LogicWait: %.1f, IOWait: %.1f, IOSend: %.1f, IORecv: %.1f, ResultProc: %.1f, TimeoutProc: %.1f",
+					bottleneck, logicWaitPct, ioWaitPct, ioSendPct, ioRecvPct, resultProcPct, resultTimeoutPct)
+				log.Printf("--> Channels: Requests: %d/%d, Results: %d/%d",
+					len(packetRequestChan), cap(packetRequestChan), len(resultChan), cap(resultChan))
 
 				lastTx = currentTx
 				lastRx = currentRx
 				lastCompleted = currentCompleted
-				lastTime = now
 
-				if currentCompleted >= uint64(len(dests)) {
+				if currentCompleted >= totalScans {
 					return
 				}
 			case <-done:
@@ -299,7 +487,7 @@ func main() {
 	// Wait for all work to complete
 	for {
 		completed := atomic.LoadUint64(&completedCount)
-		if completed >= uint64(len(dests)) {
+		if completed >= totalScans {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -334,34 +522,55 @@ func main() {
 	log.Println("Cleanup complete.")
 }
 
-// Logic Worker: generates packet requests for its assigned destinations
-func logicWorker(done <-chan struct{}, wg *sync.WaitGroup, dests []*dest, workerID int) {
+// Logic Worker: generates packet requests by pulling indices from a shared, shuffled list.
+func logicWorker(done <-chan struct{}, wg *sync.WaitGroup, gen *DestGenerator,
+	indices []uint64, sharedIndex *int64, workerID int, totalScans int, timers *SystemTimers) {
 	defer wg.Done()
 
-	for _, target := range dests {
+	for {
+		// Atomically get the next index to process.
+		myIndex := atomic.AddInt64(sharedIndex, 1)
+		if myIndex >= int64(totalScans) {
+			return // All work is claimed.
+		}
+
+		// Get the actual destination for our shuffled index.
+		shuffledIdx := indices[myIndex]
+		ip, port := gen.GetDestForIndex(shuffledIdx)
+		if ip == nil {
+			continue // Should not happen with valid indices.
+		}
+
+		startWait := time.Now()
 		select {
 		case <-done:
+			atomic.AddUint64(&timers.logicWaitNs, uint64(time.Since(startWait).Nanoseconds()))
 			return
-		case packetRequestChan <- PacketRequest{IP: target.ip, Port: target.port}:
+		case packetRequestChan <- PacketRequest{IP: ip, Port: port}:
+			atomic.AddUint64(&timers.logicWaitNs, uint64(time.Since(startWait).Nanoseconds()))
 			// Also notify the result processor to track this target
+			startWait = time.Now()
 			select {
 			case stateRequestChan <- StateRequest{
-				IP:       target.ip,
-				Port:     target.port,
+				IP:       ip,
+				Port:     port,
 				Action:   "add",
 				LastSent: time.Now(),
 				Retries:  1,
 			}:
+				atomic.AddUint64(&timers.logicWaitNs, uint64(time.Since(startWait).Nanoseconds()))
 			case <-done:
+				atomic.AddUint64(&timers.logicWaitNs, uint64(time.Since(startWait).Nanoseconds()))
 				return
 			}
 		}
 	}
 }
 
-// I/O Worker: handles all XDP socket operations
-func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.Program, numQueues, ringSize int,
-	srcMAC, gatewayMAC net.HardwareAddr, srcIP net.IP, srcPort int, verbose bool, totalTx, totalRx *uint64) {
+// I/O Worker: handles all XDP socket operations.
+// It prioritizes sending packets and periodically checks for receives to avoid TX starvation.
+func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.Program, numQueues, txRingSize, rxRingSize int,
+	srcMAC, gatewayMAC net.HardwareAddr, srcIP net.IP, srcPort int, verbose bool, totalTx, totalRx *uint64, timers *SystemTimers) {
 	defer wg.Done()
 
 	runtime.LockOSThread()
@@ -370,12 +579,12 @@ func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.P
 	// Create XDP sockets for all queues
 	var sockets []*xdp.Socket
 	socketOptions := xdp.SocketOptions{
-		NumFrames:              ringSize * 2,
+		NumFrames:              txRingSize + rxRingSize,
 		FrameSize:              4096,
-		FillRingNumDescs:       ringSize,
-		CompletionRingNumDescs: ringSize,
-		RxRingNumDescs:         ringSize,
-		TxRingNumDescs:         ringSize,
+		FillRingNumDescs:       rxRingSize,
+		CompletionRingNumDescs: txRingSize,
+		RxRingNumDescs:         rxRingSize,
+		TxRingNumDescs:         txRingSize,
 	}
 
 	for i := 0; i < numQueues; i++ {
@@ -385,15 +594,13 @@ func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.P
 		}
 		defer xsk.Close()
 
-		if err := prog.Register(i, xsk.FD()); err != nil {
-			log.Fatalf("Register socket for queue %d: %v", i, err)
+		// For the primary RX queue (0), we need to register it with the BPF program.
+		if i == 0 {
+			if err := prog.Register(i, xsk.FD()); err != nil {
+				log.Fatalf("Register socket for queue %d: %v", i, err)
+			}
+			defer prog.Unregister(i)
 		}
-		defer prog.Unregister(i)
-
-		// Busy polling
-		const busyPollTime = 50
-		unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_BUSY_POLL, busyPollTime)
-		unix.SetsockoptInt(xsk.FD(), unix.SOL_SOCKET, unix.SO_PREFER_BUSY_POLL, 1)
 
 		sockets = append(sockets, xsk)
 	}
@@ -403,10 +610,12 @@ func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.P
 		log.Fatalf("failed to create syn packet generator: %v", err)
 	}
 
-	// Pre-fill RX rings
+	// Pre-fill RX rings for all sockets that have one.
 	for _, xsk := range sockets {
-		if fillDescs := xsk.GetDescs(xsk.NumFreeFillSlots(), true); len(fillDescs) > 0 {
-			xsk.Fill(fillDescs)
+		if rxRingSize > 0 {
+			if fillDescs := xsk.GetDescs(xsk.NumFreeFillSlots(), true); len(fillDescs) > 0 {
+				xsk.Fill(fillDescs)
+			}
 		}
 	}
 
@@ -416,28 +625,34 @@ func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.P
 		currentQueue   int    = 0
 	)
 
+	// Use a ticker to periodically trigger the RX path.
+	rxCheckTicker := time.NewTicker(2 * time.Millisecond)
+	defer rxCheckTicker.Stop()
+
 	for {
 		select {
 		case <-done:
 			return
-		default:
-		}
-
-		// 1. Poll for completions and receives FIRST to free up TX slots.
-		for i, xsk := range sockets {
-			numRx, numComp, err := xsk.Poll(0)
+		case <-rxCheckTicker.C:
+			// ---- RX PATH (Low Priority) ----
+			startRecv := time.Now()
+			// Only need to check for receives on queue 0.
+			rxSocket := sockets[0]
+			numRx, numComp, err := rxSocket.Poll(0)
 			if err != nil && err != unix.EAGAIN && err != unix.EINTR && err != unix.EBADF {
-				log.Printf("Poll error on queue %d: %v", i, err)
+				log.Printf("Poll error on RX queue 0: %v", err)
 			}
+
+			// Handle completions that came in with the poll
 			if numComp > 0 {
-				xsk.Complete(numComp)
+				rxSocket.Complete(numComp)
 			}
-			// Only check for receives on queue 0 where BPF redirects
+
 			if numRx > 0 {
-				rxDescs := xsk.Receive(numRx)
+				rxDescs := rxSocket.Receive(numRx)
 				processedPackets := 0
 				for _, d := range rxDescs {
-					frame := xsk.GetFrame(d)
+					frame := rxSocket.GetFrame(d)
 					if ip, port, status := processPacket(frame, srcPort, numQueues, verbose); status != "" {
 						select {
 						case resultChan <- ScanResult{IP: ip, Port: port, Status: status}:
@@ -449,62 +664,77 @@ func ioWorker(done <-chan struct{}, wg *sync.WaitGroup, ifIndex int, prog *xdp.P
 				}
 				if processedPackets > 0 {
 					atomic.AddUint64(totalRx, uint64(processedPackets))
-					xsk.Fill(rxDescs)
 				}
+				rxSocket.Fill(rxDescs)
 			}
-		}
+			atomic.AddUint64(&timers.ioRecvNs, uint64(time.Since(startRecv).Nanoseconds()))
 
-		// 2. Top up our internal send buffer with new requests.
-	GetNewRequests:
-		for len(requestsToSend) < BATCH_SIZE*2 { // Keep a backlog
-			select {
-			case req := <-packetRequestChan:
-				requestsToSend = append(requestsToSend, req)
-			default:
-				break GetNewRequests
-			}
-		}
-
-		// 3. Send packets from our buffer.
-		if len(requestsToSend) > 0 {
+		default:
+			// ---- TX PATH (High Priority) ----
 			xsk := sockets[currentQueue]
-			numFree := xsk.NumFreeTxSlots()
 
-			if numFree > 0 {
-				numToSend := min(numFree, len(requestsToSend))
-				descs := xsk.GetDescs(numToSend, false)
-				numToSend = len(descs)
+			// We must process completions to free up TX ring slots.
+			// We can ignore RX results here as they are handled by the ticker case.
+			_, numComp, _ := xsk.Poll(0)
+			if numComp > 0 {
+				xsk.Complete(numComp)
+			}
 
-				portForThisQueue := uint16(srcPort + currentQueue)
-
-				for i := 0; i < numToSend; i++ {
-					req := requestsToSend[i]
-					frame := xsk.GetFrame(descs[i])
-					pktLen := len(packer.template)
-					packer.pack(frame[:pktLen], req.IP, portForThisQueue, req.Port, seq)
-					seq += 0x01000193
-					descs[i].Len = uint32(pktLen)
-				}
-
-				if numToSend > 0 {
-					xsk.Transmit(descs)
-					atomic.AddUint64(totalTx, uint64(numToSend))
-					requestsToSend = requestsToSend[numToSend:]
+			// Top up our internal send buffer with new requests.
+		GetNewRequests:
+			for len(requestsToSend) < BATCH_SIZE*2 {
+				select {
+				case req := <-packetRequestChan:
+					requestsToSend = append(requestsToSend, req)
+				default:
+					break GetNewRequests
 				}
 			}
-			currentQueue = (currentQueue + 1) % numQueues
-		}
 
-		// 4. Yield if we have nothing to do.
-		if len(requestsToSend) == 0 && len(packetRequestChan) == 0 {
-			runtime.Gosched()
+			// Send packets from our buffer.
+			startSend := time.Now()
+			if len(requestsToSend) > 0 {
+				numFree := xsk.NumFreeTxSlots()
+
+				if numFree > 0 {
+					numToSend := min(numFree, len(requestsToSend))
+					descs := xsk.GetDescs(numToSend, false)
+					numToSend = len(descs)
+					portForThisQueue := uint16(srcPort + currentQueue)
+
+					for i := 0; i < numToSend; i++ {
+						req := requestsToSend[i]
+						frame := xsk.GetFrame(descs[i])
+						pktLen := len(packer.template)
+						packer.pack(frame[:pktLen], req.IP, portForThisQueue, req.Port, seq)
+						seq += 0x01000193
+						descs[i].Len = uint32(pktLen)
+					}
+
+					if numToSend > 0 {
+						xsk.Transmit(descs)
+						atomic.AddUint64(totalTx, uint64(numToSend))
+						requestsToSend = requestsToSend[numToSend:]
+					}
+				}
+			}
+			atomic.AddUint64(&timers.ioSendNs, uint64(time.Since(startSend).Nanoseconds()))
+			currentQueue = (currentQueue + 1) % numQueues
+
+			// If completely idle, yield to avoid pegging the CPU.
+			if len(requestsToSend) == 0 && len(packetRequestChan) == 0 {
+				startWait := time.Now()
+				runtime.Gosched()
+				atomic.AddUint64(&timers.ioWaitNs, uint64(time.Since(startWait).Nanoseconds()))
+			}
 		}
 	}
 }
 
 // Result Processor: manages all state and handles results
 func resultProcessor(done <-chan struct{}, wg *sync.WaitGroup, retryTimeout time.Duration, maxRetries int,
-	verbose, showClosed bool, completedCount, openCount, closedCount *uint64, totalTargets int) {
+	verbose, showClosed bool, completedCount, openCount, closedCount *uint64, totalTargets int,
+	totalResponseTimeNs, totalResponsesWithTime *uint64, timers *SystemTimers) {
 	defer wg.Done()
 
 	outstanding := make(map[destKey]*dest)
@@ -520,6 +750,7 @@ func resultProcessor(done <-chan struct{}, wg *sync.WaitGroup, retryTimeout time
 			return
 
 		case <-ticker.C:
+			startTimeout := time.Now()
 			now := time.Now()
 			for {
 				front := timeoutQueue.Front()
@@ -555,8 +786,10 @@ func resultProcessor(done <-chan struct{}, wg *sync.WaitGroup, retryTimeout time
 					}
 				}
 			}
+			atomic.AddUint64(&timers.resultTimeoutNs, uint64(time.Since(startTimeout).Nanoseconds()))
 
 		case req := <-stateRequestChan:
+			startResult := time.Now()
 			if req.Action == "add" {
 				key := makeDestKey(req.IP, req.Port)
 				target := &dest{
@@ -570,9 +803,16 @@ func resultProcessor(done <-chan struct{}, wg *sync.WaitGroup, retryTimeout time
 				target.timeoutElem = timeoutQueue.PushBack(target)
 				outstanding[key] = target
 			}
+			atomic.AddUint64(&timers.resultProcNs, uint64(time.Since(startResult).Nanoseconds()))
 		case result := <-resultChan:
+			startResult := time.Now()
 			key := makeDestKey(result.IP, result.Port)
 			if target, ok := outstanding[key]; ok {
+				// Record response time before changing state
+				duration := time.Since(target.lastSent).Nanoseconds()
+				atomic.AddUint64(totalResponseTimeNs, uint64(duration))
+				atomic.AddUint64(totalResponsesWithTime, 1)
+
 				target.status = result.Status
 				delete(outstanding, key)
 
@@ -592,16 +832,9 @@ func resultProcessor(done <-chan struct{}, wg *sync.WaitGroup, retryTimeout time
 					}
 				}
 			}
+			atomic.AddUint64(&timers.resultProcNs, uint64(time.Since(startResult).Nanoseconds()))
 		}
 	}
-}
-
-// getWorkerDests slices the main destination list to distribute work among workers.
-func getWorkerDests(dests []*dest, workerID, numWorkers int) []*dest {
-	n := len(dests)
-	start := (n * workerID) / numWorkers
-	end := (n * (workerID + 1)) / numWorkers
-	return dests[start:end]
 }
 
 // configureInterfaceQueues uses ethtool to set the number of combined queues.
@@ -623,8 +856,8 @@ func configureInterfaceQueues(ifaceName string, numQueues int, verbose bool) err
 	return nil
 }
 
-func parseIPsAndCIDRs(s string) ([]net.IP, error) {
-	var ips []net.IP
+func parseIPTargets(s string) ([]IPTarget, error) {
+	var targets []IPTarget
 	for _, part := range strings.Split(s, ",") {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, "/") {
@@ -636,33 +869,9 @@ func parseIPsAndCIDRs(s string) ([]net.IP, error) {
 			if ipnet.IP.To4() == nil {
 				return nil, fmt.Errorf("only IPv4 CIDRs are supported: %q", part)
 			}
-
-			// Iterate over all IPs in the network. For subnets larger than /31,
-			// skip the network and broadcast addresses as they are not scannable.
-			maskSize, bits := ipnet.Mask.Size()
-			isRegularSubnet := bits == 32 && maskSize < 31
-
-			startIP := ipnet.IP.Mask(ipnet.Mask)
-			if isRegularSubnet {
-				inc(startIP) // Skip network address
-			}
-
-			for ip := startIP; ipnet.Contains(ip); inc(ip) {
-				addr := make(net.IP, len(ip))
-				copy(addr, ip)
-
-				// For regular subnets, check if we're at the broadcast address and stop.
-				if isRegularSubnet {
-					// The broadcast address is the last address in the range. If the next
-					// IP is not in the subnet, the current one is the broadcast address.
-					nextIP := make(net.IP, len(ip))
-					copy(nextIP, ip)
-					inc(nextIP)
-					if !ipnet.Contains(nextIP) {
-						break // Don't include broadcast address
-					}
-				}
-				ips = append(ips, addr.To4())
+			target := NewCIDRTarget(ipnet)
+			if target != nil && target.Count() > 0 {
+				targets = append(targets, target)
 			}
 		} else {
 			// Single IP
@@ -674,13 +883,13 @@ func parseIPsAndCIDRs(s string) ([]net.IP, error) {
 			if ip == nil {
 				return nil, fmt.Errorf("only IPv4 addresses are supported: %q", part)
 			}
-			ips = append(ips, ip)
+			targets = append(targets, &SingleIPTarget{IP: ip})
 		}
 	}
-	if len(ips) == 0 {
+	if len(targets) == 0 {
 		return nil, fmt.Errorf("no valid IPs or CIDRs found")
 	}
-	return ips, nil
+	return targets, nil
 }
 
 // inc increments an IP address. It is used to iterate over a CIDR range.
